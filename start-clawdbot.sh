@@ -63,7 +63,12 @@ if (process.env.CLAWDBOT_GATEWAY_TOKEN) {
     config.gateway.auth = config.gateway.auth || {};
     config.gateway.auth.token = process.env.CLAWDBOT_GATEWAY_TOKEN;
     config.gateway.auth.mode = 'token';  // Token-only auth (no device pairing)
+    config.gateway.auth.requirePairing = false;
 }
+
+// Always disable pairing requirement for sandbox deployment
+config.gateway.auth = config.gateway.auth || {};
+config.gateway.auth.requirePairing = false;
 
 // Allow insecure auth ONLY for local dev (when CLAWDBOT_DEV_MODE=true)
 if (process.env.CLAWDBOT_DEV_MODE === 'true') {

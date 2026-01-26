@@ -27,7 +27,8 @@ else
     }
   },
   "gateway": {
-    "port": 18789
+    "port": 18789,
+    "mode": "local"
   }
 }
 EOFCONFIG
@@ -53,8 +54,9 @@ config.agents.defaults.model = config.agents.defaults.model || {};
 config.gateway = config.gateway || {};
 config.channels = config.channels || {};
 
-// Gateway configuration - just port, bind is not a valid option
+// Gateway configuration
 config.gateway.port = 18789;
+config.gateway.mode = 'local';
 
 // Set gateway token if provided (use auth.token format)
 if (process.env.CLAWDBOT_GATEWAY_TOKEN) {
@@ -102,4 +104,4 @@ echo "Gateway will be available on port 18789"
 
 # Set API keys as environment variables (clawdbot reads them from env)
 # Start the gateway (blocking)
-exec clawdbot gateway --port 18789 --verbose
+exec clawdbot gateway --port 18789 --verbose --allow-unconfigured

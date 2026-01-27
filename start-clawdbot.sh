@@ -137,6 +137,24 @@ if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
     config.channels.slack.enabled = true;
 }
 
+// Anthropic Base URL override (e.g., for Cloudflare AI Gateway)
+// Usage: Set ANTHROPIC_BASE_URL to your AI Gateway endpoint like:
+//   https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/anthropic
+if (process.env.ANTHROPIC_BASE_URL) {
+    console.log('Configuring custom Anthropic base URL:', process.env.ANTHROPIC_BASE_URL);
+    config.models = config.models || {};
+    config.models.providers = config.models.providers || {};
+    config.models.providers.anthropic = {
+        baseUrl: process.env.ANTHROPIC_BASE_URL,
+        api: 'anthropic-messages',
+        models: [
+            { id: 'claude-sonnet-4-20250514', contextWindow: 200000 },
+            { id: 'claude-opus-4-20250514', contextWindow: 200000 },
+            { id: 'claude-haiku-3-5-20241022', contextWindow: 200000 },
+        ]
+    };
+}
+
 // Write updated config
 fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
 console.log('Configuration updated successfully');

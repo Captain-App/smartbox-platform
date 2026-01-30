@@ -268,8 +268,17 @@ app.all('*', async (c) => {
     console.log('[WS] URL:', request.url);
     console.log('[WS] Search params:', url.search);
     
+    // Inject gateway token into WebSocket URL for container auth
+    let wsUrl = new URL(request.url);
+    const gatewayToken = c.env.MOLTBOT_GATEWAY_TOKEN;
+    if (gatewayToken && !wsUrl.searchParams.has('token')) {
+      wsUrl.searchParams.set('token', gatewayToken);
+      console.log('[WS] Injected gateway token into WebSocket URL');
+    }
+    const wsRequest = new Request(wsUrl.toString(), request);
+    
     // Get WebSocket connection to the container
-    const containerResponse = await sandbox.wsConnect(request, MOLTBOT_PORT);
+    const containerResponse = await sandbox.wsConnect(wsRequest, MOLTBOT_PORT);
     console.log('[WS] wsConnect response status:', containerResponse.status);
     
     // Get the container-side WebSocket

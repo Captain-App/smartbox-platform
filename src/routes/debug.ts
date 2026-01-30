@@ -338,6 +338,12 @@ debug.get('/ws-test', async (c) => {
 
 // GET /debug/env - Show environment configuration (sanitized)
 debug.get('/env', async (c) => {
+  // Log all env keys for debugging
+  const envKeys = Object.keys(c.env).sort();
+  console.log('[DEBUG] Available env keys:', envKeys);
+  console.log('[DEBUG] R2_ACCESS_KEY_ID exists:', 'R2_ACCESS_KEY_ID' in c.env);
+  console.log('[DEBUG] R2_SECRET_ACCESS_KEY exists:', 'R2_SECRET_ACCESS_KEY' in c.env);
+  
   return c.json({
     has_anthropic_key: !!c.env.ANTHROPIC_API_KEY,
     has_openai_key: !!c.env.OPENAI_API_KEY,
@@ -350,6 +356,11 @@ debug.get('/env', async (c) => {
     bind_mode: c.env.CLAWDBOT_BIND_MODE,
     cf_access_team_domain: c.env.CF_ACCESS_TEAM_DOMAIN,
     has_cf_access_aud: !!c.env.CF_ACCESS_AUD,
+    // Debug: show first 4 chars of R2 secrets if they exist
+    r2_key_preview: c.env.R2_ACCESS_KEY_ID ? c.env.R2_ACCESS_KEY_ID.substring(0, 4) + '...' : null,
+    r2_secret_preview: c.env.R2_SECRET_ACCESS_KEY ? c.env.R2_SECRET_ACCESS_KEY.substring(0, 4) + '...' : null,
+    // Show all available env keys
+    all_env_keys: envKeys,
   });
 });
 

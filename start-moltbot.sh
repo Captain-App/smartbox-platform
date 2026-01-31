@@ -237,28 +237,6 @@ config.agents.defaults.model = config.agents.defaults.model || {};
 config.gateway = config.gateway || {};
 config.channels = config.channels || {};
 
-// Clean up any broken anthropic provider config from previous runs
-// (older versions didn't include required 'name' field)
-if (config.models?.providers?.anthropic?.models) {
-    const hasInvalidModels = config.models.providers.anthropic.models.some(m => !m.name);
-    if (hasInvalidModels) {
-        console.log('Removing broken anthropic provider config (missing model names)');
-        delete config.models.providers.anthropic;
-    }
-}
-
-// Clean up invalid channel config keys from previous runs
-// (dm and dmPolicy are not valid config keys)
-if (config.channels?.telegram) {
-    delete config.channels.telegram.dm;
-    delete config.channels.telegram.dmPolicy;
-}
-if (config.channels?.discord) {
-    delete config.channels.discord.dm;
-}
-
-
-
 // Gateway configuration
 config.gateway.port = 18789;
 config.gateway.mode = 'local';

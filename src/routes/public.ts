@@ -407,6 +407,19 @@ publicRoutes.get('/api/super/users/:userId/restart', async (c) => {
     const options = buildSandboxOptions(c.env);
     const sandbox = getSandbox(c.env.Sandbox, sandboxName, options);
 
+    // IMPORTANT: Sync to R2 BEFORE killing processes to preserve current state
+    // This ensures that when the container restarts, it loads the latest config
+    let syncResult: { success: boolean; error?: string } = { success: false, error: 'not attempted' };
+    try {
+      const { syncToR2 } = await import('../gateway');
+      console.log(`[RESTART] Syncing user ${userId} to R2 before restart...`);
+      syncResult = await syncToR2(sandbox, c.env, { r2Prefix: `users/${userId}` });
+      console.log(`[RESTART] Pre-restart sync result:`, syncResult.success ? 'success' : syncResult.error);
+    } catch (syncErr) {
+      console.error(`[RESTART] Pre-restart sync failed:`, syncErr);
+      syncResult = { success: false, error: syncErr instanceof Error ? syncErr.message : 'Unknown error' };
+    }
+
     // Kill all processes
     const processes = await sandbox.listProcesses();
     for (const proc of processes) {
@@ -437,6 +450,7 @@ publicRoutes.get('/api/super/users/:userId/restart', async (c) => {
       success: true,
       userId,
       sandboxName,
+      preRestartSync: syncResult,
       doctor: doctorLogs.stdout || doctorLogs.stderr,
       message: 'Gateway restarting...',
     });

@@ -34,6 +34,7 @@ import {
   ensureMoltbotGateway,
   findExistingMoltbotProcess,
   syncToR2,
+  getConsecutiveSyncFailures,
   deriveUserGatewayToken,
   getGatewayMasterToken,
   checkHealth,
@@ -46,7 +47,7 @@ import {
   logHealthEvent,
   logRestartEvent,
 } from './monitoring';
-import { publicRoutes, api, adminUi, debug, cdp } from './routes';
+import { publicRoutes, api, adminUi, debug, cdp, relayRoutes } from './routes';
 import loadingPageHtml from './assets/loading.html';
 import configErrorHtml from './assets/config-error.html';
 
@@ -289,6 +290,10 @@ app.get('/debug-bypass', async (c) => {
 
 // Mount CDP routes (uses shared secret auth via query param, not CF Access)
 app.route('/cdp', cdp);
+
+// Mount Relay routes (bot-to-bot message relay, uses its own auth middleware)
+// Requires RELAY KV namespace to be configured
+app.route('/relay', relayRoutes);
 
 // =============================================================================
 // PROTECTED ROUTES: Cloudflare Access authentication required
@@ -943,18 +948,20 @@ async function scheduled(
         issues.push({ userId, type: 'sync_failed', error: syncResult.error || 'Unknown error' });
         syncFailCount++;
 
-        // Record sync failure to D1 (only if consecutive failures)
-        // We don't want to spam issues for every single sync failure
-        const recentSyncFailures = issues.filter(i => i.userId === userId && i.type === 'sync_failed').length;
-        if (recentSyncFailures >= 3 && env.PLATFORM_DB) {
+        // Record sync failure to D1 if consecutive failures reach threshold
+        // Uses in-memory tracking across cron runs (not within single run)
+        const consecutiveFailures = getConsecutiveSyncFailures(r2Prefix);
+        if (consecutiveFailures >= 3 && env.PLATFORM_DB) {
+          console.warn(`[cron] Recording sync failure to D1: ${consecutiveFailures} consecutive failures for ${userId}`);
           await createIssue(env.PLATFORM_DB, {
             type: 'sync_failure',
             severity: 'medium',
             userId,
-            message: `Sync failed: ${syncResult.error}`,
+            message: `${consecutiveFailures} consecutive sync failures`,
             details: {
               rsyncExitCode: syncResult.rsyncExitCode,
               syncId: syncResult.syncId,
+              error: syncResult.error,
               details: syncResult.details,
             },
           });

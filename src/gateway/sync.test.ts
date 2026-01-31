@@ -64,10 +64,11 @@ describe('syncToR2', () => {
       const timestamp = '2026-01-27T12:00:00+00:00';
       let capturedSyncId = '';
 
-      // Calls: mount check, sanity check, file count before, rsync, verify sync ID, file count after
+      // Calls: mount check, sanity check, pkill stale rsync, file count before, rsync, verify sync ID, file count after
       startProcessMock
         .mockResolvedValueOnce(createMockProcess('s3fs on /data/openclaw type fuse.s3fs\n'))
         .mockResolvedValueOnce(createMockProcess('ok'))
+        .mockResolvedValueOnce(createMockProcess('')) // pkill stale rsync
         .mockResolvedValueOnce(createMockProcess('15')) // file count before
         .mockImplementationOnce((cmd: string) => {
           // Capture the syncId from the rsync command
@@ -95,10 +96,11 @@ describe('syncToR2', () => {
     it('returns error when rsync fails with non-zero exit code', async () => {
       const { sandbox, startProcessMock } = createMockSandbox();
 
-      // Calls: mount check, sanity check, file count, rsync (fails), verify (wrong syncId)
+      // Calls: mount check, sanity check, pkill stale rsync, file count, rsync (fails), verify (wrong syncId)
       startProcessMock
-        .mockResolvedValueOnce(createMockProcess('s3fs on /data/moltbot type fuse.s3fs\n'))
+        .mockResolvedValueOnce(createMockProcess('s3fs on /data/openclaw type fuse.s3fs\n'))
         .mockResolvedValueOnce(createMockProcess('ok'))
+        .mockResolvedValueOnce(createMockProcess('')) // pkill stale rsync
         .mockResolvedValueOnce(createMockProcess('15'))
         .mockResolvedValueOnce(createMockProcess('rsync error', { exitCode: 1, stderr: 'rsync error' }))
         .mockResolvedValueOnce(createMockProcess('wrong-sync-id|2026-01-27T12:00:00+00:00'));
@@ -117,8 +119,9 @@ describe('syncToR2', () => {
 
       // Rsync succeeds but sync ID doesn't match (indicates write failed)
       startProcessMock
-        .mockResolvedValueOnce(createMockProcess('s3fs on /data/moltbot type fuse.s3fs\n'))
+        .mockResolvedValueOnce(createMockProcess('s3fs on /data/openclaw type fuse.s3fs\n'))
         .mockResolvedValueOnce(createMockProcess('ok'))
+        .mockResolvedValueOnce(createMockProcess('')) // pkill stale rsync
         .mockResolvedValueOnce(createMockProcess('15'))
         .mockResolvedValueOnce(createMockProcess('', { exitCode: 0 }))
         .mockResolvedValueOnce(createMockProcess('different-id|2026-01-27T12:00:00+00:00'));
@@ -136,16 +139,17 @@ describe('syncToR2', () => {
       const timestamp = '2026-01-27T12:00:00+00:00';
 
       startProcessMock
-        .mockResolvedValueOnce(createMockProcess('s3fs on /data/moltbot type fuse.s3fs\n'))
+        .mockResolvedValueOnce(createMockProcess('s3fs on /data/openclaw type fuse.s3fs\n'))
         .mockResolvedValueOnce(createMockProcess('ok'))
+        .mockResolvedValueOnce(createMockProcess('')) // pkill stale rsync
         .mockResolvedValueOnce(createMockProcess('15'))
         .mockImplementationOnce((cmd: string) => {
           // Return process with the syncId from the command
           return Promise.resolve(createMockProcess('', { exitCode: 0 }));
         })
         .mockImplementationOnce((cmd: string) => {
-          // Extract syncId from previous command and return it
-          const syncIdMatch = startProcessMock.mock.calls[3]?.[0]?.match(/sync-\d+-[a-z0-9]+/);
+          // Extract syncId from previous command and return it (call index 4 now due to pkill)
+          const syncIdMatch = startProcessMock.mock.calls[4]?.[0]?.match(/sync-\d+-[a-z0-9]+/);
           const syncId = syncIdMatch?.[0] || 'sync-test-123';
           return Promise.resolve(createMockProcess(`${syncId}|${timestamp}`));
         })
@@ -155,8 +159,8 @@ describe('syncToR2', () => {
 
       await syncToR2(sandbox, env);
 
-      // Fourth call should be rsync (paths still use clawdbot internally)
-      const rsyncCall = startProcessMock.mock.calls[3][0];
+      // Fifth call should be rsync (after mount check, sanity check, pkill, file count)
+      const rsyncCall = startProcessMock.mock.calls[4][0];
       expect(rsyncCall).toContain('rsync');
       expect(rsyncCall).toContain('--no-times');
       expect(rsyncCall).toContain('--delete');
@@ -171,14 +175,16 @@ describe('syncToR2', () => {
       const timestamp = '2026-01-27T12:00:00+00:00';
 
       startProcessMock
-        .mockResolvedValueOnce(createMockProcess('s3fs on /data/moltbot type fuse.s3fs\n'))
+        .mockResolvedValueOnce(createMockProcess('s3fs on /data/openclaw type fuse.s3fs\n'))
         .mockResolvedValueOnce(createMockProcess('ok'))
+        .mockResolvedValueOnce(createMockProcess('')) // pkill stale rsync
         .mockResolvedValueOnce(createMockProcess('25')) // file count before
         .mockImplementationOnce((cmd: string) => {
           return Promise.resolve(createMockProcess('', { exitCode: 0 }));
         })
         .mockImplementationOnce((cmd: string) => {
-          const syncIdMatch = startProcessMock.mock.calls[3]?.[0]?.match(/sync-\d+-[a-z0-9]+/);
+          // Extract syncId from previous command (call index 4 now due to pkill)
+          const syncIdMatch = startProcessMock.mock.calls[4]?.[0]?.match(/sync-\d+-[a-z0-9]+/);
           const syncId = syncIdMatch?.[0] || 'sync-test-123';
           return Promise.resolve(createMockProcess(`${syncId}|${timestamp}`));
         })

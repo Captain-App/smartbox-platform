@@ -45,6 +45,22 @@ export function getRecentSyncResults(r2Prefix?: string): SyncResult[] {
 }
 
 /**
+ * Get count of consecutive sync failures (from most recent)
+ */
+export function getConsecutiveSyncFailures(r2Prefix?: string): number {
+  const results = getRecentSyncResults(r2Prefix);
+  let count = 0;
+  for (const result of results) {
+    if (!result.success) {
+      count++;
+    } else {
+      break; // Stop at first success
+    }
+  }
+  return count;
+}
+
+/**
  * Store a sync result for debugging
  */
 function storeSyncResult(r2Prefix: string | undefined, result: SyncResult): void {
@@ -142,6 +158,28 @@ export async function syncToR2(
     };
     storeSyncResult(options.r2Prefix, result);
     return result;
+  }
+
+  // Check if a sync is already running to prevent pileup
+  // This is critical because the cron runs every minute and rsync can hang on slow s3fs mounts
+  try {
+    const checkProc = await sandbox.startProcess('pgrep -f "rsync.*/root/.clawdbot" 2>/dev/null | head -1');
+    await waitForProcess(checkProc, 3000);
+    const checkLogs = await checkProc.getLogs();
+    if (checkLogs.stdout?.trim()) {
+      console.log(`[sync] Skipping sync - another rsync already running for ${options.r2Prefix || 'default'}`);
+      const result: SyncResult = {
+        success: false,
+        error: 'Sync already in progress',
+        details: 'Another rsync process is still running. Skipping to prevent pileup.',
+        syncId,
+        durationMs: Date.now() - startTime,
+      };
+      storeSyncResult(options.r2Prefix, result);
+      return result;
+    }
+  } catch {
+    // Non-critical, continue with sync
   }
 
   // Count files before sync for verification

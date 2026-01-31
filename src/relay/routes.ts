@@ -388,36 +388,35 @@ authenticatedRelay.post('/broadcast', async (c) => {
     );
   }
 
-  // Create relay message
-  const message: RelayMessage = {
-    messageId,
-    text: text || '',
-    botId: relayAuth.botId,
-    botName: membershipData.botName || relayAuth.botName,
-    timestamp,
-    replyToMessageId,
-    threadId,
-    mediaUrl,
-    mediaType,
-  };
-
-  // Write to KV with TTL
-  // Key format ensures messages are sorted by timestamp when listed
-  const msgKey = RelayKV.messageKey(groupId, timestamp, messageId);
-  
+  // Write to D1 (upsert to handle duplicates)
   try {
-    await c.env.RELAY.put(msgKey, JSON.stringify(message), {
-      expirationTtl: RelayTTL.MESSAGE,
-    });
+    await c.env.PLATFORM_DB.prepare(`
+      INSERT INTO relay_messages (group_id, bot_id, bot_name, message_id, text, timestamp, reply_to_message_id, thread_id, media_url, media_type)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (group_id, bot_id, message_id) DO UPDATE SET
+        text = excluded.text,
+        timestamp = excluded.timestamp
+    `).bind(
+      groupId,
+      relayAuth.botId,
+      membershipData.botName || relayAuth.botName,
+      messageId,
+      text || '',
+      timestamp,
+      replyToMessageId || null,
+      threadId || null,
+      mediaUrl || null,
+      mediaType || null
+    ).run();
     
     console.log(
-      `[RELAY] Broadcast OK: bot=${relayAuth.botId} group=${groupId} key=${msgKey} text="${text?.slice(0, 50)}..."`
+      `[RELAY] Broadcast OK: bot=${relayAuth.botId} group=${groupId} msg=${messageId} text="${text?.slice(0, 50)}..."`
     );
     
     return c.json<BroadcastResponse>({ ok: true });
   } catch (e) {
-    console.error(`[RELAY] Broadcast KV error: ${e}`);
-    return c.json<BroadcastResponse>({ ok: false, error: 'KV write failed' }, 500);
+    console.error(`[RELAY] Broadcast D1 error: ${e}`);
+    return c.json<BroadcastResponse>({ ok: false, error: 'Database write failed' }, 500);
   }
 });
 
@@ -459,51 +458,32 @@ authenticatedRelay.get('/poll', async (c) => {
     );
   }
 
-  // List messages from KV for this group
-  // KV list returns in ascending order (oldest first due to padded timestamps in keys)
-  const prefix = RelayKV.messagePrefixByGroup(groupId);
+  // Query D1 for messages (simple and efficient!)
+  const query = includeSelf
+    ? `SELECT * FROM relay_messages WHERE group_id = ? AND timestamp > ? ORDER BY timestamp ASC LIMIT ?`
+    : `SELECT * FROM relay_messages WHERE group_id = ? AND timestamp > ? AND bot_id != ? ORDER BY timestamp ASC LIMIT ?`;
   
-  // Paginate through keys to find ones after 'since' timestamp
-  // This is necessary because KV doesn't support "start_after" for keys
-  let allRelevantKeys: { name: string }[] = [];
-  let cursor: string | undefined = undefined;
-  const sincePadded = String(since).padStart(15, '0');
+  const params = includeSelf
+    ? [groupId, since, limit]
+    : [groupId, since, relayAuth.botId, limit];
   
-  // Paginate until we have enough relevant keys or exhaust the list
-  do {
-    const listResult = await c.env.RELAY.list({ prefix, cursor, limit: 500 });
-    
-    // Filter keys by timestamp embedded in key name
-    for (const key of listResult.keys) {
-      const parts = key.name.split(':');
-      const keyTimestamp = parts[3]; // Already padded
-      if (keyTimestamp > sincePadded) {
-        allRelevantKeys.push(key);
-        if (allRelevantKeys.length >= limit + 50) break; // Got enough
-      }
-    }
-    
-    cursor = listResult.list_complete ? undefined : listResult.cursor;
-  } while (cursor && allRelevantKeys.length < limit + 50);
-
-  const messages: RelayMessage[] = [];
-  let maxTimestamp = since;
-
-  for (const key of allRelevantKeys) {
-    const msgData = await c.env.RELAY.get(key.name, 'json') as RelayMessage | null;
-    if (!msgData) continue;
-
-    // Filter out own messages (unless includeSelf=true for debugging)
-    if (!includeSelf && msgData.botId === relayAuth.botId) continue;
-
-    messages.push(msgData);
-    maxTimestamp = Math.max(maxTimestamp, msgData.timestamp);
-
-    if (messages.length >= limit) break;
-  }
-
-  // Sort by timestamp ascending
-  messages.sort((a, b) => a.timestamp - b.timestamp);
+  const result = await c.env.PLATFORM_DB.prepare(query).bind(...params).all();
+  
+  const messages: RelayMessage[] = (result.results || []).map((row: any) => ({
+    messageId: row.message_id,
+    text: row.text || '',
+    botId: row.bot_id,
+    botName: row.bot_name,
+    timestamp: row.timestamp,
+    replyToMessageId: row.reply_to_message_id,
+    threadId: row.thread_id,
+    mediaUrl: row.media_url,
+    mediaType: row.media_type,
+  }));
+  
+  const maxTimestamp = messages.length > 0 
+    ? Math.max(...messages.map(m => m.timestamp))
+    : since;
 
   console.log(
     `[RELAY] Poll: bot=${relayAuth.botId} group=${groupId} since=${since} returned=${messages.length}`

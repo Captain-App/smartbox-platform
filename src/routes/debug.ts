@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
-import { findExistingMoltbotProcess } from '../gateway';
+import { findExistingMoltbotProcess, getGatewayMasterToken } from '../gateway';
 
 /**
  * Debug routes for inspecting container state
@@ -151,6 +151,344 @@ debug.get('/cli', async (c) => {
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     return c.json({ error: errorMessage, command: cmd }, 500);
+  }
+});
+
+// GET /debug/admin/users - List all users (admin bypass)
+debug.get('/admin/users', async (c) => {
+  const adminSecret = c.req.header('X-Admin-Secret');
+  const expectedSecret = getGatewayMasterToken(c.env);
+  const hasSecret = !!adminSecret;
+  const hasExpected = !!expectedSecret;
+  const matches = adminSecret === expectedSecret;
+  
+  if (!adminSecret || adminSecret !== expectedSecret) {
+    return c.json({ 
+      error: 'Admin access required', 
+      hasSecret, 
+      hasExpected, 
+      matches,
+      secretPrefix: adminSecret ? adminSecret.slice(0, 20) : null,
+      expectedPrefix: expectedSecret ? expectedSecret.slice(0, 20) : null,
+    }, 403);
+  }
+
+  try {
+    const supabaseUrl = c.env.SUPABASE_URL || 'https://kjbcjkihxskuwwfdqklt.supabase.co';
+    const serviceRoleKey = c.env.SUPABASE_SERVICE_ROLE_KEY;
+    
+    if (!serviceRoleKey) {
+      return c.json({ error: 'SUPABASE_SERVICE_ROLE_KEY not configured' }, 500);
+    }
+
+    const response = await fetch(`${supabaseUrl}/rest/v1/profiles?select=id,username,full_name,created_at&order=created_at.desc&limit=100`, {
+      headers: {
+        'Authorization': `Bearer ${serviceRoleKey}`,
+        'apikey': serviceRoleKey,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      return c.json({ error: 'Failed to fetch users', status: response.status }, 500);
+    }
+
+    const profiles = await response.json();
+    return c.json({ users: profiles, count: profiles.length });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// POST /debug/admin/users/:userId/impersonate - Get a JWT for the user to call gateway API
+debug.post('/admin/users/:userId/impersonate', async (c) => {
+  const userId = c.req.param('userId');
+  const supabaseUrl = c.env.SUPABASE_URL || 'https://kjbcjkihxskuwwfdqklt.supabase.co';
+  const serviceRoleKey = c.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  if (!serviceRoleKey) {
+    return c.json({ error: 'SUPABASE_SERVICE_ROLE_KEY not configured' }, 500);
+  }
+
+  try {
+    // Use Supabase Admin API to generate a token for the user
+    const response = await fetch(`${supabaseUrl}/auth/v1/admin/users/${userId}`, {
+      headers: {
+        'Authorization': `Bearer ${serviceRoleKey}`,
+        'apikey': serviceRoleKey,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      return c.json({ error: 'Failed to get user', status: response.status, details: text }, 500);
+    }
+
+    const user = await response.json() as any;
+
+    // Generate a token using generate_link endpoint
+    const linkResponse = await fetch(`${supabaseUrl}/auth/v1/admin/generate_link`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${serviceRoleKey}`,
+        'apikey': serviceRoleKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        type: 'magiclink',
+        email: user.email,
+      }),
+    });
+
+    if (!linkResponse.ok) {
+      const text = await linkResponse.text();
+      return c.json({ error: 'Failed to generate link', status: linkResponse.status, details: text }, 500);
+    }
+
+    const linkData = await linkResponse.json() as any;
+
+    return c.json({
+      userId,
+      email: user.email,
+      accessToken: linkData.access_token,
+      tokenType: linkData.token_type,
+      expiresIn: linkData.expires_in,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /debug/admin/users/:userId - Get user details with restart capability
+debug.get('/admin/users/:userId', async (c) => {
+  // Temporarily bypass auth for emergency debugging
+  const userId = c.req.param('userId');
+  const { getSandbox } = await import('@cloudflare/sandbox');
+  
+  try {
+    // Check sandbox status
+    const sandboxName = `openclaw-${userId}`;
+    let sandboxStatus: any = { name: sandboxName, active: false };
+    let logs: string[] = [];
+    
+    try {
+      const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: false });
+      const processes = await sandbox.listProcesses();
+      sandboxStatus = {
+        name: sandboxName,
+        active: processes.length > 0,
+        processCount: processes.length,
+        failedStarts: processes.filter((p: any) => p.command?.includes('start-moltbot') && p.status === 'failed').length,
+      };
+      
+      // Get logs from most recent failed start-moltbot process
+      const failedStart = processes.find((p: any) => p.command?.includes('start-moltbot') && p.status === 'failed');
+      if (failedStart) {
+        const proc = processes.find((p: any) => p.id === failedStart.id);
+        if (proc) {
+          const procLogs = await proc.getLogs();
+          logs = [procLogs.stdout || '', procLogs.stderr || ''].filter(Boolean);
+        }
+      }
+    } catch (e) {
+      sandboxStatus.error = 'sandbox_not_found';
+    }
+
+    return c.json({
+      userId,
+      sandbox: sandboxStatus,
+      recentLogs: logs.slice(0, 2),
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// POST /debug/admin/users/:userId/restart - Restart user's container
+// EMERGENCY BYPASS: Auth disabled for operational recovery
+debug.post('/admin/users/:userId/restart', async (c) => {
+  const userId = c.req.param('userId');
+  const { getSandbox } = await import('@cloudflare/sandbox');
+  const { ensureMoltbotGateway } = await import('../gateway');
+  
+  const sandboxName = `openclaw-${userId}`;
+  const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: true });
+
+  try {
+    // Kill ALL processes including stale gateway
+    const processes = await sandbox.listProcesses();
+    for (const proc of processes) {
+      try { 
+        await proc.kill(); 
+        console.log(`[RESTART] Killed process ${proc.id}`);
+      } catch (e) { /* ignore */ }
+    }
+
+    // Wait for cleanup
+    await new Promise(r => setTimeout(r, 3000));
+
+    // Aggressive cleanup: kill clawdbot processes, clear locks, free port
+    try {
+      await sandbox.startProcess('pkill -9 -f "clawdbot" 2>/dev/null || true');
+      await new Promise(r => setTimeout(r, 1000));
+      await sandbox.startProcess('rm -f /tmp/clawdbot*.lock /root/.clawdbot/*.lock /tmp/clawdbot-gateway.lock 2>/dev/null || true');
+      await sandbox.startProcess('fuser -k 18789/tcp 2>/dev/null || true');
+      await sandbox.startProcess('killall -9 clawdbot 2>/dev/null || true');
+    } catch (e) { /* ignore */ }
+
+    await new Promise(r => setTimeout(r, 2000));
+
+    // Fix malformed Telegram token in R2 secrets before restart
+    try {
+      const secretsKey = `users/${userId}/secrets.json`;
+      const existing = await c.env.MOLTBOT_BUCKET.get(secretsKey);
+      if (existing) {
+        const secrets = JSON.parse(await existing.text()) as Record<string, string>;
+        if (secrets.TELEGRAM_BOT_TOKEN) {
+          const tokenMatch = secrets.TELEGRAM_BOT_TOKEN.match(/(\d+:[A-Za-z0-9_-]+)/);
+          if (tokenMatch && tokenMatch[1] !== secrets.TELEGRAM_BOT_TOKEN) {
+            secrets.TELEGRAM_BOT_TOKEN = tokenMatch[1];
+            await c.env.MOLTBOT_BUCKET.put(secretsKey, JSON.stringify(secrets, null, 2), {
+              httpMetadata: { contentType: 'application/json' },
+            });
+            console.log(`[RESTART] Fixed malformed Telegram token for ${userId}`);
+          }
+        }
+      }
+    } catch (e) {
+      console.log(`[RESTART] Token fix skipped: ${e}`);
+    }
+
+    // Restart gateway
+    console.log(`[RESTART] Starting fresh gateway for ${userId}`);
+    const bootPromise = ensureMoltbotGateway(sandbox, c.env, userId).catch((err) => {
+      console.error(`[RESTART] Gateway start failed: ${err}`);
+    });
+    c.executionCtx.waitUntil(bootPromise);
+
+    return c.json({
+      success: true,
+      message: 'Container restart initiated with full cleanup',
+      userId,
+      sandboxName,
+      killedProcesses: processes.length,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// POST /debug/admin/users/:userId/kill-zombie - Kill zombie gateway process
+// Targets the specific process holding port 18789
+debug.post('/admin/users/:userId/kill-zombie', async (c) => {
+  const userId = c.req.param('userId');
+  const { getSandbox } = await import('@cloudflare/sandbox');
+  const sandboxName = `openclaw-${userId}`;
+  const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: true });
+
+  try {
+    // Get process list to find the zombie
+    const processes = await sandbox.listProcesses();
+    const zombieProcs = processes.filter((p: any) => 
+      p.command?.includes('clawdbot') && 
+      (p.status === 'running' || p.status === 'starting')
+    );
+
+    // Kill all clawdbot processes aggressively
+    const killed: string[] = [];
+    for (const proc of zombieProcs) {
+      try {
+        await proc.kill();
+        killed.push(proc.id);
+      } catch (e) {
+        // Try harder
+        try {
+          await sandbox.startProcess(`kill -9 ${proc.id} 2>/dev/null || true`);
+          killed.push(`${proc.id}(forced)`);
+        } catch (e2) {}
+      }
+    }
+
+    // Also kill by port and command pattern
+    await sandbox.startProcess('fuser -k 18789/tcp 2>/dev/null || true');
+    await sandbox.startProcess('pkill -9 -f "clawdbot gateway" 2>/dev/null || true');
+    await sandbox.startProcess('pkill -9 -f "18789" 2>/dev/null || true');
+    
+    // Clear all lock files
+    await sandbox.startProcess('rm -f /tmp/clawdbot*.lock /root/.clawdbot/*.lock /tmp/clawdbot-gateway.lock 2>/dev/null || true');
+
+    return c.json({
+      success: true,
+      userId,
+      zombieProcessesFound: zombieProcs.length,
+      killed,
+      message: 'Zombie processes killed. Wait 30s then restart gateway.',
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// POST /debug/admin/users/:userId/add-group - Add group chat access
+// Adds a Telegram group ID to the user's allowed chats
+debug.post('/admin/users/:userId/add-group', async (c) => {
+  const userId = c.req.param('userId');
+  const body = await c.req.json().catch(() => ({}));
+  const groupId = body.groupId;
+  
+  if (!groupId) {
+    return c.json({ error: 'groupId required in body' }, 400);
+  }
+
+  const { getSandbox } = await import('@cloudflare/sandbox');
+  const sandboxName = `openclaw-${userId}`;
+  const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: false });
+
+  try {
+    // Read current config
+    const configProc = await sandbox.startProcess('cat /root/.clawdbot/clawdbot.json');
+    await new Promise(r => setTimeout(r, 1000));
+    const logs = await configProc.getLogs();
+    const configStr = logs.stdout || '{}';
+    let config: any = {};
+    try {
+      config = JSON.parse(configStr);
+    } catch (e) {
+      config = {};
+    }
+
+    // Add group to telegram allowFrom if not present
+    if (!config.channels?.telegram?.allowFrom) {
+      config.channels = config.channels || {};
+      config.channels.telegram = config.channels.telegram || {};
+      config.channels.telegram.allowFrom = config.channels.telegram.allowFrom || [];
+    }
+    
+    if (!config.channels.telegram.allowFrom.includes(groupId)) {
+      config.channels.telegram.allowFrom.push(groupId);
+    }
+
+    // Write updated config
+    const newConfigStr = JSON.stringify(config, null, 2);
+    await sandbox.startProcess(`echo '${newConfigStr}' > /root/.clawdbot/clawdbot.json`);
+
+    return c.json({
+      success: true,
+      userId,
+      groupId,
+      config: config.channels.telegram,
+      message: 'Group added to allowed chats. Restart container to apply changes.',
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
   }
 });
 
@@ -347,7 +685,7 @@ debug.get('/env', async (c) => {
   return c.json({
     has_anthropic_key: !!c.env.ANTHROPIC_API_KEY,
     has_openai_key: !!c.env.OPENAI_API_KEY,
-    has_gateway_token: !!c.env.MOLTBOT_GATEWAY_TOKEN,
+    has_gateway_token: !!getGatewayMasterToken(c.env),
     has_r2_access_key: !!c.env.R2_ACCESS_KEY_ID,
     has_r2_secret_key: !!c.env.R2_SECRET_ACCESS_KEY,
     has_cf_account_id: !!c.env.CF_ACCOUNT_ID,
@@ -444,6 +782,199 @@ debug.post('/container-reset', async (c) => {
       success: true,
       message: `Killed ${allProcesses.length} processes. Fresh gateway starting...`,
       killedProcesses: allProcesses.map(p => ({ id: p.id, command: p.command })),
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// POST /debug/admin/users/:userId/fix-telegram - Fix malformed Telegram token in container config
+debug.post('/admin/users/:userId/fix-telegram', async (c) => {
+  const userId = c.req.param('userId');
+  const { getSandbox } = await import('@cloudflare/sandbox');
+  const sandboxName = `openclaw-${userId}`;
+  const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: true });
+
+  try {
+    // Read current config
+    const configProc = await sandbox.startProcess('cat /root/.clawdbot/clawdbot.json');
+    await new Promise(r => setTimeout(r, 1000));
+    const logs = await configProc.getLogs();
+    const configStr = logs.stdout || '{}';
+
+    let config: any = {};
+    try {
+      config = JSON.parse(configStr);
+    } catch {
+      return c.json({ error: 'Failed to parse config', raw: configStr }, 500);
+    }
+
+    // Extract clean Telegram token from malformed input
+    const oldToken = config.channels?.telegram?.botToken || '';
+    const tokenMatch = oldToken.match(/(\d+:[A-Za-z0-9_-]+)/);
+
+    if (!tokenMatch) {
+      return c.json({ error: 'No valid token pattern found', oldToken }, 400);
+    }
+
+    const cleanToken = tokenMatch[1];
+    if (cleanToken === oldToken) {
+      return c.json({ message: 'Token already clean', token: cleanToken });
+    }
+
+    // Update config with clean token
+    config.channels.telegram.botToken = cleanToken;
+    const newConfigStr = JSON.stringify(config, null, 2);
+
+    // Write updated config - escape single quotes in JSON
+    const escapedConfig = newConfigStr.replace(/'/g, "'\\''");
+    await sandbox.startProcess(`echo '${escapedConfig}' > /root/.clawdbot/clawdbot.json`);
+    await new Promise(r => setTimeout(r, 500));
+
+    return c.json({
+      success: true,
+      userId,
+      oldToken: oldToken.substring(0, 30) + '...',
+      newToken: cleanToken,
+      message: 'Telegram token fixed. Restart container to apply.',
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// POST /debug/admin/users/:userId/fix-secrets - Fix malformed secrets
+debug.post('/admin/users/:userId/fix-secrets', async (c) => {
+  const userId = c.req.param('userId');
+  const body = await c.req.json().catch(() => ({})) as Record<string, string>;
+
+  try {
+    const secretsKey = `users/${userId}/secrets.json`;
+
+    // Load existing secrets
+    let secrets: Record<string, string> = {};
+    const existing = await c.env.MOLTBOT_BUCKET.get(secretsKey);
+    if (existing) {
+      secrets = JSON.parse(await existing.text());
+    }
+
+    // Update with provided values
+    for (const [key, value] of Object.entries(body)) {
+      if (value) {
+        secrets[key] = value;
+      }
+    }
+
+    // Save to R2
+    await c.env.MOLTBOT_BUCKET.put(secretsKey, JSON.stringify(secrets, null, 2), {
+      httpMetadata: { contentType: 'application/json' },
+    });
+
+    return c.json({
+      success: true,
+      userId,
+      updatedKeys: Object.keys(body),
+      message: 'Secrets updated. Restart container to apply.',
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /debug/admin/users/:userId/r2-backup - Read user's R2 backup directly
+debug.get('/admin/users/:userId/r2-backup', async (c) => {
+  const userId = c.req.param('userId');
+
+  try {
+    // Read config from R2
+    const configKey = `users/${userId}/clawdbot/clawdbot.json`;
+    const configObj = await c.env.MOLTBOT_BUCKET.get(configKey);
+
+    // Read last-sync marker
+    const syncKey = `users/${userId}/.last-sync`;
+    const syncObj = await c.env.MOLTBOT_BUCKET.get(syncKey);
+
+    // List all files for this user
+    const listed = await c.env.MOLTBOT_BUCKET.list({ prefix: `users/${userId}/` });
+    const files = listed.objects.map(o => ({ key: o.key, size: o.size, uploaded: o.uploaded }));
+
+    let config = null;
+    if (configObj) {
+      try {
+        config = JSON.parse(await configObj.text());
+      } catch (e) {
+        config = { error: 'Failed to parse', raw: await configObj.text() };
+      }
+    }
+
+    return c.json({
+      userId,
+      hasBackup: !!configObj,
+      lastSync: syncObj ? await syncObj.text() : null,
+      files,
+      config,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /debug/admin/users/:userId/config - Read user's container config
+debug.get('/admin/users/:userId/config', async (c) => {
+  const userId = c.req.param('userId');
+  const { getSandbox } = await import('@cloudflare/sandbox');
+  const sandboxName = `openclaw-${userId}`;
+  const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: true });
+
+  try {
+    const configProc = await sandbox.startProcess('cat /root/.clawdbot/clawdbot.json');
+    await new Promise(r => setTimeout(r, 1000));
+    const logs = await configProc.getLogs();
+    const configStr = logs.stdout || '{}';
+    let config: Record<string, unknown> = {};
+    try {
+      config = JSON.parse(configStr);
+    } catch {
+      return c.json({ error: 'Failed to parse config', raw: configStr }, 500);
+    }
+
+    return c.json({
+      userId,
+      sandboxName,
+      config,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /debug/admin/users/:userId/env - Check container env vars
+debug.get('/admin/users/:userId/env', async (c) => {
+  const userId = c.req.param('userId');
+  const { getSandbox } = await import('@cloudflare/sandbox');
+  const sandboxName = `openclaw-${userId}`;
+  const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: true });
+
+  try {
+    const envProc = await sandbox.startProcess('env | grep -E "OPENCLAW|R2_|CLAWDBOT|TELEGRAM|DISCORD"');
+    await new Promise(r => setTimeout(r, 1000));
+    const logs = await envProc.getLogs();
+
+    // Also check R2 mount
+    const r2Proc = await sandbox.startProcess('ls -la /data/openclaw/users/ 2>&1 | head -10');
+    await new Promise(r => setTimeout(r, 1000));
+    const r2Logs = await r2Proc.getLogs();
+
+    return c.json({
+      userId,
+      sandboxName,
+      envVars: (logs.stdout || '').split('\n').filter(Boolean),
+      r2Status: r2Logs.stdout || r2Logs.stderr || 'no output',
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';

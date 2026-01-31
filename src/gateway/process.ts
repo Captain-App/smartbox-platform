@@ -1,7 +1,7 @@
 import type { Sandbox, Process } from '@cloudflare/sandbox';
 import type { MoltbotEnv } from '../types';
 import { MOLTBOT_PORT, STARTUP_TIMEOUT_MS } from '../config';
-import { buildEnvVars, deriveUserGatewayToken } from './env';
+import { buildEnvVars, deriveUserGatewayToken, getGatewayMasterToken } from './env';
 import { mountR2Storage } from './r2';
 
 /**
@@ -78,6 +78,23 @@ export async function ensureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv, us
   // R2 is used as a backup - the startup script will restore from it on boot
   await mountR2Storage(sandbox, env);
 
+  // Ensure user is registered in R2 for cron discovery
+  // This writes a marker file so the cron can find new users
+  if (userId && env.MOLTBOT_BUCKET) {
+    try {
+      const markerKey = `users/${userId}/.registered`;
+      const existing = await env.MOLTBOT_BUCKET.head(markerKey);
+      if (!existing) {
+        const now = new Date().toISOString();
+        await env.MOLTBOT_BUCKET.put(markerKey, JSON.stringify({ registeredAt: now, userId }));
+        console.log(`[Gateway] Registered new user ${userId.slice(0, 8)}... in R2 for cron discovery`);
+      }
+    } catch (err) {
+      // Non-critical - user will be discovered eventually
+      console.log(`[Gateway] Failed to register user in R2:`, err);
+    }
+  }
+
   // Check if Moltbot is already running or starting
   const existingProcess = await findExistingMoltbotProcess(sandbox);
   if (existingProcess) {
@@ -104,8 +121,9 @@ export async function ensureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv, us
 
   // Derive per-user gateway token if userId provided
   let userGatewayToken: string | undefined;
-  if (userId && env.MOLTBOT_GATEWAY_TOKEN) {
-    userGatewayToken = await deriveUserGatewayToken(env.MOLTBOT_GATEWAY_TOKEN, userId);
+  const masterToken = getGatewayMasterToken(env);
+  if (userId && masterToken) {
+    userGatewayToken = await deriveUserGatewayToken(masterToken, userId);
     console.log(`[Gateway] Derived per-user token for user ${userId.slice(0, 8)}...`);
   }
 
@@ -117,14 +135,19 @@ export async function ensureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv, us
 
   // Start a new Moltbot gateway
   console.log('Starting new Moltbot gateway...');
-  const envVars = buildEnvVars(env, userGatewayToken);
+  console.log(`[Gateway] userId param: ${userId || '(not set)'}`);
+  const envVars = buildEnvVars(env, userGatewayToken, userId);
+  console.log(`[Gateway] OPENCLAW_USER_ID in envVars: ${envVars.OPENCLAW_USER_ID || '(not set)'}`);
+  console.log(`[Gateway] CLAWDBOT_GATEWAY_TOKEN in envVars: ${envVars.CLAWDBOT_GATEWAY_TOKEN ? '(set)' : '(not set)'}`);
+  console.log(`[Gateway] R2_ACCESS_KEY_ID in envVars: ${envVars.R2_ACCESS_KEY_ID ? '(set)' : '(not set)'}`);
+  console.log(`[Gateway] ANTHROPIC_API_KEY in envVars: ${envVars.ANTHROPIC_API_KEY ? '(set)' : '(not set)'}`);
+  console.log(`[Gateway] AI_GATEWAY_BASE_URL in envVars: ${envVars.AI_GATEWAY_BASE_URL || '(not set)'}`);
+  console.log(`[Gateway] OPENAI_API_KEY in envVars: ${envVars.OPENAI_API_KEY ? '(set)' : '(not set)'}`);
+  console.log(`[Gateway] Total env vars: ${Object.keys(envVars).length}`);
 
-  // Merge user secrets into env vars (user secrets override worker secrets)
-  // This allows users to configure their own bot tokens
-  if (userSecrets.TELEGRAM_BOT_TOKEN) envVars.TELEGRAM_BOT_TOKEN = userSecrets.TELEGRAM_BOT_TOKEN;
-  if (userSecrets.DISCORD_BOT_TOKEN) envVars.DISCORD_BOT_TOKEN = userSecrets.DISCORD_BOT_TOKEN;
-  if (userSecrets.SLACK_BOT_TOKEN) envVars.SLACK_BOT_TOKEN = userSecrets.SLACK_BOT_TOKEN;
-  if (userSecrets.SLACK_APP_TOKEN) envVars.SLACK_APP_TOKEN = userSecrets.SLACK_APP_TOKEN;
+  // Merge user secrets into env vars for API keys only
+  // Channel tokens (Telegram, Discord, Slack) are managed via the bot's control UI
+  // and stored in the bot's config file, not injected via env vars
   if (userSecrets.ANTHROPIC_API_KEY) envVars.ANTHROPIC_API_KEY = userSecrets.ANTHROPIC_API_KEY;
   if (userSecrets.OPENAI_API_KEY) envVars.OPENAI_API_KEY = userSecrets.OPENAI_API_KEY;
 

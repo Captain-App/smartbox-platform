@@ -63,6 +63,14 @@
       "bucket_name": "moltbot-data",
     },
   ],
+  // KV namespace for bot-to-bot relay
+  // Created with: wrangler kv namespace create RELAY
+  "kv_namespaces": [
+    {
+      "binding": "RELAY",
+      "id": "74dfe39996c64c7caad0b655da925cbe",
+    },
+  ],
   // D1 database for platform issues tracking
   // Create with: wrangler d1 create moltworker-platform
   // Apply migrations with: wrangler d1 migrations apply moltworker-platform

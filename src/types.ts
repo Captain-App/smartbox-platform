@@ -52,6 +52,9 @@ export interface MoltbotEnv {
 
   // Admin configuration
   ADMIN_USER_IDS?: string; // Comma-separated list of user IDs who can access admin debug endpoints
+
+  // Bot-to-Bot Relay KV namespace
+  RELAY?: KVNamespace;
 }
 
 /**

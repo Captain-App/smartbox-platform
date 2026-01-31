@@ -254,37 +254,8 @@ if (process.env.CLAWDBOT_GATEWAY_TOKEN) {
 config.gateway.controlUi = config.gateway.controlUi || {};
 config.gateway.controlUi.allowInsecureAuth = true;
 
-// Telegram configuration
-if (process.env.TELEGRAM_BOT_TOKEN) {
-    config.channels.telegram = config.channels.telegram || {};
-    // Extract token from potentially malformed input (e.g., "description: 123:ABC..." -> "123:ABC...")
-    // Telegram tokens are always in format: number:alphanumeric
-    let telegramToken = process.env.TELEGRAM_BOT_TOKEN;
-    const tokenMatch = telegramToken.match(/(\d+:[A-Za-z0-9_-]+)/);
-    if (tokenMatch) {
-        telegramToken = tokenMatch[1];
-        if (telegramToken !== process.env.TELEGRAM_BOT_TOKEN) {
-            console.log('Extracted Telegram token from malformed input');
-        }
-    }
-    config.channels.telegram.botToken = telegramToken;
-    config.channels.telegram.enabled = true;
-}
-
-// Discord configuration
-if (process.env.DISCORD_BOT_TOKEN) {
-    config.channels.discord = config.channels.discord || {};
-    config.channels.discord.token = process.env.DISCORD_BOT_TOKEN;
-    config.channels.discord.enabled = true;
-}
-
-// Slack configuration
-if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
-    config.channels.slack = config.channels.slack || {};
-    config.channels.slack.botToken = process.env.SLACK_BOT_TOKEN;
-    config.channels.slack.appToken = process.env.SLACK_APP_TOKEN;
-    config.channels.slack.enabled = true;
-}
+// Channel configuration (Telegram, Discord, Slack) is managed by the bot itself
+// via the control UI and persisted to R2. We don't override it here.
 
 // Base URL override (e.g., for Cloudflare AI Gateway)
 // Usage: Set AI_GATEWAY_BASE_URL or ANTHROPIC_BASE_URL to your endpoint like:

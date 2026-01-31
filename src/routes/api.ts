@@ -245,11 +245,22 @@ adminApi.post('/users/:userId/restart', async (c) => {
 
   const userId = c.req.param('userId');
   const { getSandbox } = await import('@cloudflare/sandbox');
-  
+
   const sandboxName = `openclaw-${userId}`;
   const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: true });
 
   try {
+    // IMPORTANT: Sync to R2 BEFORE killing processes to preserve current state
+    let syncResult: { success: boolean; error?: string } = { success: false, error: 'not attempted' };
+    try {
+      console.log(`[RESTART] Syncing user ${userId} to R2 before restart...`);
+      syncResult = await syncToR2(sandbox, c.env, { r2Prefix: `users/${userId}` });
+      console.log(`[RESTART] Pre-restart sync result:`, syncResult.success ? 'success' : syncResult.error);
+    } catch (syncErr) {
+      console.error(`[RESTART] Pre-restart sync failed:`, syncErr);
+      syncResult = { success: false, error: syncErr instanceof Error ? syncErr.message : 'Unknown error' };
+    }
+
     // Kill all processes
     const processes = await sandbox.listProcesses();
     for (const proc of processes) {
@@ -270,6 +281,7 @@ adminApi.post('/users/:userId/restart', async (c) => {
     return c.json({
       success: true,
       message: 'Container restart initiated',
+      preRestartSync: syncResult,
       userId,
       sandboxName,
     });
@@ -593,12 +605,27 @@ adminApi.post('/gateway/restart', async (c) => {
 // POST /api/admin/container/reset - FORCE reset: kill all processes and restart gateway
 adminApi.post('/container/reset', async (c) => {
   const sandbox = c.get('sandbox');
+  const user = c.get('user');
+  const userId = user?.id;
 
   try {
+    // IMPORTANT: Sync to R2 BEFORE killing processes to preserve current state
+    let syncResult: { success: boolean; error?: string } = { success: false, error: 'not attempted' };
+    if (userId) {
+      try {
+        console.log(`[RESET] Syncing user ${userId} to R2 before reset...`);
+        syncResult = await syncToR2(sandbox, c.env, { r2Prefix: `users/${userId}` });
+        console.log(`[RESET] Pre-reset sync result:`, syncResult.success ? 'success' : syncResult.error);
+      } catch (syncErr) {
+        console.error(`[RESET] Pre-reset sync failed:`, syncErr);
+        syncResult = { success: false, error: syncErr instanceof Error ? syncErr.message : 'Unknown error' };
+      }
+    }
+
     // Get ALL processes and kill them
     const allProcesses = await sandbox.listProcesses();
     console.log(`[RESET] Found ${allProcesses.length} processes to kill`);
-    
+
     for (const proc of allProcesses) {
       console.log(`[RESET] Killing process ${proc.id}: ${proc.command}`);
       try {
@@ -607,10 +634,10 @@ adminApi.post('/container/reset', async (c) => {
         console.error(`[RESET] Error killing process ${proc.id}:`, killErr);
       }
     }
-    
+
     // Wait for processes to die
     await new Promise(r => setTimeout(r, 3000));
-    
+
     // Clear any lock files
     try {
       const clearLocks = await sandbox.startProcess('rm -f /tmp/clawdbot-gateway.lock /root/.clawdbot/gateway.lock 2>/dev/null; echo "locks cleared"');
@@ -620,7 +647,7 @@ adminApi.post('/container/reset', async (c) => {
     }
 
     // Start fresh gateway
-    const bootPromise = ensureMoltbotGateway(sandbox, c.env).catch((err) => {
+    const bootPromise = ensureMoltbotGateway(sandbox, c.env, userId).catch((err) => {
       console.error('[RESET] Gateway start failed:', err);
     });
     c.executionCtx.waitUntil(bootPromise);
@@ -628,6 +655,7 @@ adminApi.post('/container/reset', async (c) => {
     return c.json({
       success: true,
       message: `Killed ${allProcesses.length} processes. Fresh gateway starting...`,
+      preResetSync: syncResult,
       killedProcesses: allProcesses.map(p => ({ id: p.id, command: p.command })),
     });
   } catch (error) {
@@ -915,6 +943,17 @@ adminApi.post('/users/:userId/reset', async (c) => {
   const targetSandbox = getSandbox(c.env.Sandbox, `openclaw-${targetUserId}`, { keepAlive: true });
 
   try {
+    // IMPORTANT: Sync to R2 BEFORE killing processes to preserve current state
+    let syncResult: { success: boolean; error?: string } = { success: false, error: 'not attempted' };
+    try {
+      console.log(`[RESET] Syncing user ${targetUserId} to R2 before reset...`);
+      syncResult = await syncToR2(targetSandbox, c.env, { r2Prefix: `users/${targetUserId}` });
+      console.log(`[RESET] Pre-reset sync result:`, syncResult.success ? 'success' : syncResult.error);
+    } catch (syncErr) {
+      console.error(`[RESET] Pre-reset sync failed:`, syncErr);
+      syncResult = { success: false, error: syncErr instanceof Error ? syncErr.message : 'Unknown error' };
+    }
+
     // Kill all processes
     const processes = await targetSandbox.listProcesses();
     for (const proc of processes) {
@@ -935,6 +974,7 @@ adminApi.post('/users/:userId/reset', async (c) => {
     return c.json({
       success: true,
       message: 'Container reset initiated',
+      preResetSync: syncResult,
       targetUser: targetUserId,
       sandboxName: `openclaw-${targetUserId}`,
     });

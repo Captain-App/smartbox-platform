@@ -27,7 +27,8 @@ RUN mkdir -p /root/.clawdbot \
     && mkdir -p /root/clawd/skills
 
 # Copy startup script
-# Build cache bust: 2026-01-30-v1-token-reset
+# Build cache bust: 2026-01-31-v6-sanitize-restored-config
+ARG BUILD_VERSION=v6-sanitize-restored
 COPY start-moltbot.sh /usr/local/bin/start-moltbot.sh
 RUN chmod +x /usr/local/bin/start-moltbot.sh
 

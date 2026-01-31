@@ -85,29 +85,27 @@ describe('buildEnvVars', () => {
     expect(result.OPENAI_API_KEY).toBe('sk-openai-key');
   });
 
-  it('maps MOLTBOT_GATEWAY_TOKEN to CLAWDBOT_GATEWAY_TOKEN for container', () => {
-    const env = createMockEnv({ MOLTBOT_GATEWAY_TOKEN: 'my-token' });
+  it('maps MOLTBOT_GATEWAY_MASTER_TOKEN to CLAWDBOT_GATEWAY_TOKEN for container', () => {
+    const env = createMockEnv({ MOLTBOT_GATEWAY_MASTER_TOKEN: 'my-token' });
     const result = buildEnvVars(env);
     expect(result.CLAWDBOT_GATEWAY_TOKEN).toBe('my-token');
   });
 
-  it('includes all channel tokens when set', () => {
+  it('does not pass channel tokens to container (managed by bot config)', () => {
+    // Channel tokens are now managed via the bot's control UI and stored in config,
+    // not injected via env vars (prevents config reset on container restart)
     const env = createMockEnv({
       TELEGRAM_BOT_TOKEN: 'tg-token',
-      TELEGRAM_DM_POLICY: 'pairing',
       DISCORD_BOT_TOKEN: 'discord-token',
-      DISCORD_DM_POLICY: 'open',
       SLACK_BOT_TOKEN: 'slack-bot',
       SLACK_APP_TOKEN: 'slack-app',
     });
     const result = buildEnvVars(env);
-    
-    expect(result.TELEGRAM_BOT_TOKEN).toBe('tg-token');
-    expect(result.TELEGRAM_DM_POLICY).toBe('pairing');
-    expect(result.DISCORD_BOT_TOKEN).toBe('discord-token');
-    expect(result.DISCORD_DM_POLICY).toBe('open');
-    expect(result.SLACK_BOT_TOKEN).toBe('slack-bot');
-    expect(result.SLACK_APP_TOKEN).toBe('slack-app');
+
+    expect(result.TELEGRAM_BOT_TOKEN).toBeUndefined();
+    expect(result.DISCORD_BOT_TOKEN).toBeUndefined();
+    expect(result.SLACK_BOT_TOKEN).toBeUndefined();
+    expect(result.SLACK_APP_TOKEN).toBeUndefined();
   });
 
   it('maps DEV_MODE to CLAWDBOT_DEV_MODE for container', () => {
@@ -124,15 +122,13 @@ describe('buildEnvVars', () => {
   it('combines all env vars correctly', () => {
     const env = createMockEnv({
       ANTHROPIC_API_KEY: 'sk-key',
-      MOLTBOT_GATEWAY_TOKEN: 'token',
-      TELEGRAM_BOT_TOKEN: 'tg',
+      MOLTBOT_GATEWAY_MASTER_TOKEN: 'token',
     });
     const result = buildEnvVars(env);
-    
+
     expect(result).toEqual({
       ANTHROPIC_API_KEY: 'sk-key',
       CLAWDBOT_GATEWAY_TOKEN: 'token',
-      TELEGRAM_BOT_TOKEN: 'tg',
     });
   });
 });

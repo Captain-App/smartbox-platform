@@ -1,7 +1,7 @@
 export { buildEnvVars, deriveUserGatewayToken, getGatewayMasterToken } from './env';
 export { mountR2Storage } from './r2';
 export { findExistingMoltbotProcess, ensureMoltbotGateway } from './process';
-export { syncToR2, getRecentSyncResults } from './sync';
+export { syncToR2, getRecentSyncResults, getConsecutiveSyncFailures } from './sync';
 export type { SyncResult } from './sync';
 export { waitForProcess } from './utils';
 export {

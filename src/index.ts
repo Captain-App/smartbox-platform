@@ -153,7 +153,14 @@ function getSandboxNameForRequest(c: { get: (key: 'user') => AuthenticatedUser |
 
 // Middleware: Initialize sandbox for all requests
 // Note: For authenticated routes, the sandbox name is updated after auth middleware runs
+// Skip sandbox init for debug/admin routes - they create their own sandbox instances
 app.use('*', async (c, next) => {
+  const url = new URL(c.req.url);
+  if (url.pathname.startsWith('/debug/admin/')) {
+    // Debug admin routes handle their own sandbox instances
+    return next();
+  }
+
   const options = buildSandboxOptions(c.env);
   // Initially use default sandbox; will be updated for authenticated users
   const sandboxName = getSandboxNameForRequest(c);
@@ -395,16 +402,14 @@ app.get('/emergency-reset', async (c) => {
   console.log(`[RESET] Resetting sandbox for user: ${userId}`);
 
   try {
+    // Kill existing gateway processes only (not cleanup commands)
     const allProcesses = await sandbox.listProcesses();
     for (const proc of allProcesses) {
       try { await proc.kill(); } catch (e) { /* ignore */ }
     }
     await new Promise(r => setTimeout(r, 2000));
 
-    try {
-      await sandbox.startProcess('rm -f /tmp/clawdbot-gateway.lock /root/.clawdbot/gateway.lock 2>/dev/null');
-    } catch (e) { /* ignore */ }
-
+    // Start fresh gateway - it handles its own lock cleanup internally
     const bootPromise = ensureMoltbotGateway(sandbox, c.env, userId).catch(() => {});
     c.executionCtx.waitUntil(bootPromise);
 
@@ -421,16 +426,14 @@ app.post('/emergency-reset', async (c) => {
   console.log(`[RESET] Resetting sandbox for user: ${userId}`);
 
   try {
+    // Kill existing gateway processes only (not cleanup commands)
     const allProcesses = await sandbox.listProcesses();
     for (const proc of allProcesses) {
       try { await proc.kill(); } catch (e) { /* ignore */ }
     }
     await new Promise(r => setTimeout(r, 2000));
 
-    try {
-      await sandbox.startProcess('rm -f /tmp/clawdbot-gateway.lock /root/.clawdbot/gateway.lock 2>/dev/null');
-    } catch (e) { /* ignore */ }
-
+    // Start fresh gateway - it handles its own lock cleanup internally
     const bootPromise = ensureMoltbotGateway(sandbox, c.env, userId).catch(() => {});
     c.executionCtx.waitUntil(bootPromise);
 
@@ -897,12 +900,7 @@ async function scheduled(
             }
             await new Promise(r => setTimeout(r, 2000));
 
-            // Clear locks
-            try {
-              await sandbox.startProcess('rm -f /tmp/clawdbot-gateway.lock /root/.clawdbot/gateway.lock 2>/dev/null');
-            } catch { /* ignore */ }
-
-            // Start fresh gateway (don't await - let it run async)
+            // Start fresh gateway - it handles its own lock cleanup internally
             ensureMoltbotGateway(sandbox, env, userId).catch((err) => {
               console.error(`[cron] Auto-restart failed for ${sandboxName}:`, err);
             });

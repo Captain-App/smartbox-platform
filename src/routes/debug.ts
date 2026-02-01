@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { findExistingMoltbotProcess, getGatewayMasterToken } from '../gateway';
+import { getRecentSyncResults, getConsecutiveSyncFailures } from '../gateway/sync';
 
 /**
  * Debug routes for inspecting container state
@@ -8,6 +9,39 @@ import { findExistingMoltbotProcess, getGatewayMasterToken } from '../gateway';
  * when mounted in the main app
  */
 const debug = new Hono<AppEnv>();
+
+// GET /debug/admin/ping - Simple ping that doesn't touch sandbox (must be before :userId routes)
+debug.get('/admin/ping', async (c) => {
+  return c.json({ pong: true, timestamp: new Date().toISOString() });
+});
+
+// GET /debug/admin/users/:userId/ps - List processes with commands
+debug.get('/admin/users/:userId/ps', async (c) => {
+  const userId = c.req.param('userId');
+  const { getSandbox } = await import('@cloudflare/sandbox');
+  const sandboxName = `openclaw-${userId}`;
+  const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: false });
+
+  try {
+    const processes = await sandbox.listProcesses();
+    const procs = await Promise.all(processes.map(async (p: any) => {
+      let logs = { stdout: '', stderr: '' };
+      try {
+        logs = await p.getLogs();
+      } catch {}
+      return {
+        id: p.id,
+        command: p.command?.substring(0, 100),
+        status: p.status,
+        stdout: logs.stdout?.substring(0, 500),
+        stderr: logs.stderr?.substring(0, 500),
+      };
+    }));
+    return c.json({ userId, processCount: procs.length, processes: procs });
+  } catch (error) {
+    return c.json({ error: String(error) }, 500);
+  }
+});
 
 // GET /debug/version - Returns version info from inside the container
 debug.get('/version', async (c) => {
@@ -329,19 +363,11 @@ debug.post('/admin/users/:userId/restart', async (c) => {
       } catch (e) { /* ignore */ }
     }
 
-    // Wait for cleanup
+    // Wait for processes to terminate
     await new Promise(r => setTimeout(r, 3000));
 
-    // Aggressive cleanup: kill clawdbot processes, clear locks, free port
-    try {
-      await sandbox.startProcess('pkill -9 -f "clawdbot" 2>/dev/null || true');
-      await new Promise(r => setTimeout(r, 1000));
-      await sandbox.startProcess('rm -f /tmp/clawdbot*.lock /root/.clawdbot/*.lock /tmp/clawdbot-gateway.lock 2>/dev/null || true');
-      await sandbox.startProcess('fuser -k 18789/tcp 2>/dev/null || true');
-      await sandbox.startProcess('killall -9 clawdbot 2>/dev/null || true');
-    } catch (e) { /* ignore */ }
-
-    await new Promise(r => setTimeout(r, 2000));
+    // NOTE: Removed aggressive cleanup startProcess calls - they were accumulating
+    // The startup script (start-moltbot.sh) handles its own lock cleanup internally
 
     // Fix malformed Telegram token in R2 secrets before restart
     try {
@@ -384,8 +410,8 @@ debug.post('/admin/users/:userId/restart', async (c) => {
   }
 });
 
-// POST /debug/admin/users/:userId/kill-zombie - Kill zombie gateway process
-// Targets the specific process holding port 18789
+// POST /debug/admin/users/:userId/kill-zombie - Kill all processes in sandbox
+// Uses sandbox API only - no shell commands to avoid process accumulation
 debug.post('/admin/users/:userId/kill-zombie', async (c) => {
   const userId = c.req.param('userId');
   const { getSandbox } = await import('@cloudflare/sandbox');
@@ -393,46 +419,67 @@ debug.post('/admin/users/:userId/kill-zombie', async (c) => {
   const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: true });
 
   try {
-    // Get process list to find the zombie
+    // Get all processes and kill them via sandbox API
     const processes = await sandbox.listProcesses();
-    const zombieProcs = processes.filter((p: any) => 
-      p.command?.includes('clawdbot') && 
-      (p.status === 'running' || p.status === 'starting')
-    );
-
-    // Kill all clawdbot processes aggressively
     const killed: string[] = [];
-    for (const proc of zombieProcs) {
+    
+    for (const proc of processes) {
       try {
         await proc.kill();
         killed.push(proc.id);
       } catch (e) {
-        // Try harder
-        try {
-          await sandbox.startProcess(`kill -9 ${proc.id} 2>/dev/null || true`);
-          killed.push(`${proc.id}(forced)`);
-        } catch (e2) {}
+        // Process may already be dead, that's fine
       }
     }
 
-    // Also kill by port and command pattern
-    await sandbox.startProcess('fuser -k 18789/tcp 2>/dev/null || true');
-    await sandbox.startProcess('pkill -9 -f "clawdbot gateway" 2>/dev/null || true');
-    await sandbox.startProcess('pkill -9 -f "18789" 2>/dev/null || true');
-    
-    // Clear all lock files
-    await sandbox.startProcess('rm -f /tmp/clawdbot*.lock /root/.clawdbot/*.lock /tmp/clawdbot-gateway.lock 2>/dev/null || true');
+    // NOTE: Removed shell-based cleanup (fuser, pkill, rm) - they were causing process accumulation
+    // The startup script handles its own lock cleanup internally
 
     return c.json({
       success: true,
       userId,
-      zombieProcessesFound: zombieProcs.length,
+      processesFound: processes.length,
       killed,
-      message: 'Zombie processes killed. Wait 30s then restart gateway.',
+      message: 'Processes killed via sandbox API. Gateway will handle lock cleanup on restart.',
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// POST /debug/admin/users/:userId/destroy - Force destroy a stuck sandbox
+// Calls destroy() directly without trying to list processes first
+debug.post('/admin/users/:userId/destroy', async (c) => {
+  const userId = c.req.param('userId');
+  const { getSandbox } = await import('@cloudflare/sandbox');
+  const sandboxName = `openclaw-${userId}`;
+
+  try {
+    const sandbox = getSandbox(c.env.Sandbox, sandboxName, {
+      keepAlive: false,
+      containerTimeouts: {
+        instanceGetTimeoutMS: 5000,
+        portReadyTimeoutMS: 5000,
+      },
+    });
+
+    // Race destroy against a timeout
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Destroy timed out after 10s')), 10000)
+    );
+
+    await Promise.race([sandbox.destroy(), timeoutPromise]);
+
+    return c.json({
+      success: true,
+      userId,
+      sandboxName,
+      message: 'Sandbox destroyed. Will recreate on next request.',
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage, note: 'Sandbox may be stuck at infrastructure level' }, 500);
   }
 });
 
@@ -702,6 +749,157 @@ debug.get('/env', async (c) => {
   });
 });
 
+// GET /debug/sync-status - Show R2 sync status for debugging backup/restore issues
+debug.get('/sync-status', async (c) => {
+  const sandbox = c.get('sandbox');
+  const user = c.get('user');
+  const userId = user?.id;
+
+  try {
+    const r2Prefix = userId ? `users/${userId}` : undefined;
+
+    // Get in-memory sync results (from Worker cron)
+    const recentResults = getRecentSyncResults(r2Prefix);
+    const consecutiveFailures = getConsecutiveSyncFailures(r2Prefix);
+
+    // Read .last-sync from container (local state)
+    let localSyncInfo: { timestamp: string | null; error?: string } = { timestamp: null };
+    try {
+      const localProc = await sandbox.startProcess('cat /root/.clawdbot/.last-sync 2>/dev/null || echo "NOT_FOUND"');
+      await new Promise(r => setTimeout(r, 1000));
+      const localLogs = await localProc.getLogs();
+      const content = (localLogs.stdout || '').trim();
+      if (content && content !== 'NOT_FOUND') {
+        localSyncInfo.timestamp = content;
+      }
+    } catch (err) {
+      localSyncInfo.error = err instanceof Error ? err.message : 'Unknown error';
+    }
+
+    // Read .last-sync from R2 mount (backup state)
+    let r2SyncInfo: { timestamp: string | null; error?: string } = { timestamp: null };
+    const r2Path = userId ? `/data/openclaw/users/${userId}/.last-sync` : '/data/openclaw/.last-sync';
+    try {
+      const r2Proc = await sandbox.startProcess(`cat ${r2Path} 2>/dev/null || echo "NOT_FOUND"`);
+      await new Promise(r => setTimeout(r, 1000));
+      const r2Logs = await r2Proc.getLogs();
+      const content = (r2Logs.stdout || '').trim();
+      if (content && content !== 'NOT_FOUND') {
+        r2SyncInfo.timestamp = content;
+      }
+    } catch (err) {
+      r2SyncInfo.error = err instanceof Error ? err.message : 'Unknown error';
+    }
+
+    // Check if R2 is mounted
+    let r2Mounted = false;
+    try {
+      const mountProc = await sandbox.startProcess('mountpoint -q /data/openclaw && echo "MOUNTED" || echo "NOT_MOUNTED"');
+      await new Promise(r => setTimeout(r, 500));
+      const mountLogs = await mountProc.getLogs();
+      r2Mounted = (mountLogs.stdout || '').includes('MOUNTED');
+    } catch {
+      // Ignore
+    }
+
+    // Check if a sync is currently running
+    let syncRunning = false;
+    try {
+      const syncProc = await sandbox.startProcess('pgrep -f "rsync.*/root/.clawdbot" >/dev/null && echo "RUNNING" || echo "NOT_RUNNING"');
+      await new Promise(r => setTimeout(r, 500));
+      const syncLogs = await syncProc.getLogs();
+      syncRunning = (syncLogs.stdout || '').includes('RUNNING');
+    } catch {
+      // Ignore
+    }
+
+    // Check if clawdbot.json exists locally
+    let hasLocalConfig = false;
+    try {
+      const configProc = await sandbox.startProcess('test -f /root/.clawdbot/clawdbot.json && echo "EXISTS"');
+      await new Promise(r => setTimeout(r, 500));
+      const configLogs = await configProc.getLogs();
+      hasLocalConfig = (configLogs.stdout || '').includes('EXISTS');
+    } catch {
+      // Ignore
+    }
+
+    return c.json({
+      userId: userId || 'unknown',
+      r2Prefix: r2Prefix || 'default',
+      r2Mounted,
+      syncCurrentlyRunning: syncRunning,
+      hasLocalConfig,
+      local: localSyncInfo,
+      r2: r2SyncInfo,
+      inMemoryResults: {
+        consecutiveFailures,
+        recentCount: recentResults.length,
+        results: recentResults.slice(0, 5), // Last 5 results
+      },
+      diagnosis: diagnoseIssues(localSyncInfo, r2SyncInfo, r2Mounted, hasLocalConfig, consecutiveFailures),
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// Helper function to diagnose common sync issues
+function diagnoseIssues(
+  localSync: { timestamp: string | null; error?: string },
+  r2Sync: { timestamp: string | null; error?: string },
+  r2Mounted: boolean,
+  hasLocalConfig: boolean,
+  consecutiveFailures: number
+): string[] {
+  const issues: string[] = [];
+
+  if (!r2Mounted) {
+    issues.push('CRITICAL: R2 storage is not mounted. Backups cannot run.');
+  }
+
+  if (!hasLocalConfig) {
+    issues.push('WARNING: No local clawdbot.json. Sync will be skipped to prevent wiping R2 backup.');
+  }
+
+  if (!r2Sync.timestamp && hasLocalConfig) {
+    issues.push('WARNING: No R2 backup exists yet. First backup may not have run.');
+  }
+
+  if (consecutiveFailures >= 3) {
+    issues.push(`ALERT: ${consecutiveFailures} consecutive sync failures. Check Worker logs.`);
+  }
+
+  if (localSync.timestamp && r2Sync.timestamp) {
+    // Parse timestamps for comparison
+    const localPart = localSync.timestamp.split('|')[1] || localSync.timestamp;
+    const r2Part = r2Sync.timestamp.split('|')[1] || r2Sync.timestamp;
+
+    try {
+      const localTime = new Date(localPart).getTime();
+      const r2Time = new Date(r2Part).getTime();
+      const diffMinutes = Math.abs(localTime - r2Time) / 60000;
+
+      if (diffMinutes > 10) {
+        if (localTime > r2Time) {
+          issues.push(`WARNING: Local is ${Math.round(diffMinutes)}min ahead of R2. Backup may be stale.`);
+        } else {
+          issues.push(`INFO: R2 is ${Math.round(diffMinutes)}min ahead of local. Restore may be pending.`);
+        }
+      }
+    } catch {
+      // Can't parse timestamps
+    }
+  }
+
+  if (issues.length === 0) {
+    issues.push('OK: No obvious issues detected.');
+  }
+
+  return issues;
+}
+
 // GET /debug/container-config - Read the moltbot config from inside the container
 debug.get('/container-config', async (c) => {
   const sandbox = c.get('sandbox');
@@ -761,13 +959,7 @@ debug.post('/container-reset', async (c) => {
     // Wait for processes to die
     await new Promise(r => setTimeout(r, 3000));
     
-    // Clear any lock files
-    try {
-      const clearLocks = await sandbox.startProcess('rm -f /tmp/clawdbot-gateway.lock /root/.clawdbot/gateway.lock 2>/dev/null; echo "locks cleared"');
-      await new Promise(r => setTimeout(r, 1000));
-    } catch (e) {
-      console.log('[RESET] Lock clear warning:', e);
-    }
+    // NOTE: Removed lock-clearing startProcess - startup script handles its own cleanup
 
     // Import ensureMoltbotGateway dynamically to avoid circular dependency
     const { ensureMoltbotGateway } = await import('../gateway');
@@ -952,6 +1144,212 @@ debug.get('/admin/users/:userId/config', async (c) => {
     return c.json({ error: errorMessage }, 500);
   }
 });
+
+// GET /debug/admin/users/:userId/sync-status - Check sync status for a specific user
+debug.get('/admin/users/:userId/sync-status', async (c) => {
+  const userId = c.req.param('userId');
+  const { getSandbox } = await import('@cloudflare/sandbox');
+  const sandboxName = `openclaw-${userId}`;
+
+  try {
+    const r2Prefix = `users/${userId}`;
+
+    // Get in-memory sync results
+    const recentResults = getRecentSyncResults(r2Prefix);
+    const consecutiveFailures = getConsecutiveSyncFailures(r2Prefix);
+
+    // Read .last-sync directly from R2 bucket (doesn't require container)
+    let r2SyncFromBucket: { timestamp: string | null; error?: string } = { timestamp: null };
+    try {
+      const syncKey = `users/${userId}/.last-sync`;
+      const syncObj = await c.env.MOLTBOT_BUCKET.get(syncKey);
+      if (syncObj) {
+        r2SyncFromBucket.timestamp = await syncObj.text();
+      }
+    } catch (err) {
+      r2SyncFromBucket.error = err instanceof Error ? err.message : 'Unknown error';
+    }
+
+    // Check if backup exists in R2
+    let r2BackupExists = false;
+    let r2BackupFiles: string[] = [];
+    try {
+      const listed = await c.env.MOLTBOT_BUCKET.list({ prefix: `users/${userId}/` });
+      r2BackupFiles = listed.objects.map(o => o.key);
+      r2BackupExists = r2BackupFiles.some(k => k.includes('clawdbot.json'));
+    } catch {
+      // Ignore
+    }
+
+    // Try to get container status if available
+    let containerStatus: Record<string, unknown> = { available: false };
+    let localSyncInfo: { timestamp: string | null; error?: string } = { timestamp: null };
+    let hasLocalConfig = false;
+    let syncRunning = false;
+    let r2Mounted = false;
+
+    try {
+      const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: false });
+      const processes = await sandbox.listProcesses();
+      containerStatus = {
+        available: true,
+        processCount: processes.length,
+        gatewayRunning: processes.some((p: any) => p.command?.includes('clawdbot gateway') && p.status === 'running'),
+      };
+
+      // Read local .last-sync
+      try {
+        const localProc = await sandbox.startProcess('cat /root/.clawdbot/.last-sync 2>/dev/null || echo "NOT_FOUND"');
+        await new Promise(r => setTimeout(r, 1000));
+        const localLogs = await localProc.getLogs();
+        const content = (localLogs.stdout || '').trim();
+        if (content && content !== 'NOT_FOUND') {
+          localSyncInfo.timestamp = content;
+        }
+      } catch (err) {
+        localSyncInfo.error = err instanceof Error ? err.message : 'Unknown error';
+      }
+
+      // Check R2 mount
+      try {
+        const mountProc = await sandbox.startProcess('mountpoint -q /data/openclaw && echo "MOUNTED" || echo "NOT_MOUNTED"');
+        await new Promise(r => setTimeout(r, 500));
+        const mountLogs = await mountProc.getLogs();
+        r2Mounted = (mountLogs.stdout || '').includes('MOUNTED');
+      } catch {
+        // Ignore
+      }
+
+      // Check local config
+      try {
+        const configProc = await sandbox.startProcess('test -f /root/.clawdbot/clawdbot.json && echo "EXISTS"');
+        await new Promise(r => setTimeout(r, 500));
+        const configLogs = await configProc.getLogs();
+        hasLocalConfig = (configLogs.stdout || '').includes('EXISTS');
+      } catch {
+        // Ignore
+      }
+
+      // Check sync running
+      try {
+        const syncProc = await sandbox.startProcess('pgrep -f "rsync.*/root/.clawdbot" >/dev/null && echo "RUNNING" || echo "NOT_RUNNING"');
+        await new Promise(r => setTimeout(r, 500));
+        const syncLogs = await syncProc.getLogs();
+        syncRunning = (syncLogs.stdout || '').includes('RUNNING');
+      } catch {
+        // Ignore
+      }
+
+    } catch {
+      // Container not available, that's okay
+    }
+
+    return c.json({
+      userId,
+      sandboxName,
+      container: {
+        ...containerStatus,
+        r2Mounted,
+        hasLocalConfig,
+        syncRunning,
+        localSync: localSyncInfo,
+      },
+      r2Bucket: {
+        backupExists: r2BackupExists,
+        lastSync: r2SyncFromBucket,
+        fileCount: r2BackupFiles.length,
+        files: r2BackupFiles,
+      },
+      inMemoryResults: {
+        consecutiveFailures,
+        recentCount: recentResults.length,
+        results: recentResults.slice(0, 5),
+      },
+      diagnosis: diagnoseUserIssues(
+        r2SyncFromBucket,
+        localSyncInfo,
+        r2BackupExists,
+        r2Mounted,
+        hasLocalConfig,
+        consecutiveFailures,
+        containerStatus.available as boolean
+      ),
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// Helper function to diagnose user-specific sync issues
+function diagnoseUserIssues(
+  r2Sync: { timestamp: string | null; error?: string },
+  localSync: { timestamp: string | null; error?: string },
+  r2BackupExists: boolean,
+  r2Mounted: boolean,
+  hasLocalConfig: boolean,
+  consecutiveFailures: number,
+  containerAvailable: boolean
+): string[] {
+  const issues: string[] = [];
+
+  if (!r2BackupExists) {
+    issues.push('CRITICAL: No backup in R2 bucket. User data will be lost on container restart!');
+  }
+
+  if (!containerAvailable) {
+    issues.push('INFO: Container not running. Cannot check live sync status.');
+    if (r2BackupExists) {
+      issues.push('OK: R2 backup exists, will restore on next container start.');
+    }
+    return issues;
+  }
+
+  if (!r2Mounted) {
+    issues.push('CRITICAL: R2 storage not mounted in container. Backups cannot run.');
+  }
+
+  if (!hasLocalConfig) {
+    issues.push('WARNING: No local clawdbot.json in container. Sync skipped to prevent wiping R2.');
+    if (r2BackupExists) {
+      issues.push('INFO: R2 backup exists but wasn\'t restored. Check startup logs.');
+    }
+  }
+
+  if (consecutiveFailures >= 3) {
+    issues.push(`ALERT: ${consecutiveFailures} consecutive sync failures.`);
+  }
+
+  if (!r2Sync.timestamp && hasLocalConfig) {
+    issues.push('WARNING: R2 has no .last-sync file. Backup may never have succeeded.');
+  }
+
+  if (localSync.timestamp && r2Sync.timestamp) {
+    const localPart = localSync.timestamp.split('|')[1] || localSync.timestamp;
+    const r2Part = r2Sync.timestamp.split('|')[1] || r2Sync.timestamp;
+    try {
+      const localTime = new Date(localPart).getTime();
+      const r2Time = new Date(r2Part).getTime();
+      const diffMinutes = Math.abs(localTime - r2Time) / 60000;
+
+      if (diffMinutes > 10) {
+        if (localTime > r2Time) {
+          issues.push(`WARNING: Local ${Math.round(diffMinutes)}min ahead of R2. Recent changes not backed up.`);
+        } else {
+          issues.push(`INFO: R2 ${Math.round(diffMinutes)}min ahead of local. Container may have old data.`);
+        }
+      }
+    } catch {
+      // Can't parse
+    }
+  }
+
+  if (issues.length === 0) {
+    issues.push('OK: Sync appears healthy.');
+  }
+
+  return issues;
+}
 
 // GET /debug/admin/users/:userId/env - Check container env vars
 debug.get('/admin/users/:userId/env', async (c) => {

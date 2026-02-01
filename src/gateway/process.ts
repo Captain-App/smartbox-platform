@@ -5,6 +5,13 @@ import { buildEnvVars, deriveUserGatewayToken, getGatewayMasterToken } from './e
 import { mountR2Storage } from './r2';
 
 /**
+ * In-memory lock to prevent concurrent gateway starts for the same sandbox.
+ * Key is sandbox name (e.g., 'openclaw-{userId}'), value is a promise that resolves
+ * when the start attempt completes.
+ */
+const startupLocks: Map<string, Promise<Process>> = new Map();
+
+/**
  * Load user-specific secrets from R2
  * These are stored at users/{userId}/secrets.json
  */
@@ -74,6 +81,43 @@ export async function findExistingMoltbotProcess(sandbox: Sandbox): Promise<Proc
  * @returns The running gateway process
  */
 export async function ensureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv, userId?: string): Promise<Process> {
+  // Use sandbox name as lock key to prevent concurrent starts for the same container
+  const sandboxName = userId ? `openclaw-${userId}` : 'openclaw-default';
+
+  // Check if there's already a startup in progress for this sandbox
+  const existingStartup = startupLocks.get(sandboxName);
+  if (existingStartup) {
+    console.log(`[Gateway] Startup already in progress for ${sandboxName}, waiting...`);
+    try {
+      return await existingStartup;
+    } catch {
+      // Previous startup failed, we'll try again below
+      console.log(`[Gateway] Previous startup failed for ${sandboxName}, retrying...`);
+    }
+  }
+
+  // Create a new startup promise and store it
+  const startupPromise = doEnsureMoltbotGateway(sandbox, env, userId, sandboxName);
+  startupLocks.set(sandboxName, startupPromise);
+
+  try {
+    const result = await startupPromise;
+    return result;
+  } finally {
+    // Clean up the lock after completion (success or failure)
+    // Use setTimeout to keep the lock for a short time to prevent rapid retries
+    setTimeout(() => {
+      if (startupLocks.get(sandboxName) === startupPromise) {
+        startupLocks.delete(sandboxName);
+      }
+    }, 5000);
+  }
+}
+
+/**
+ * Internal implementation of ensureMoltbotGateway
+ */
+async function doEnsureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv, userId: string | undefined, sandboxName: string): Promise<Process> {
   // Mount R2 storage for persistent data (non-blocking if not configured)
   // R2 is used as a backup - the startup script will restore from it on boot
   await mountR2Storage(sandbox, env);

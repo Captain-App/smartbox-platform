@@ -1434,4 +1434,80 @@ debug.get('/admin/users/:userId/env', async (c) => {
   }
 });
 
+// GET /debug/admin/backups - List available backup dates
+debug.get('/admin/backups', async (c) => {
+  const adminSecret = c.req.header('X-Admin-Secret');
+  const expectedSecret = getGatewayMasterToken(c.env);
+  
+  if (!adminSecret || adminSecret !== expectedSecret) {
+    return c.json({ error: 'Admin access required' }, 403);
+  }
+
+  try {
+    const { listBackupDates } = await import('../gateway/backup');
+    const dates = await listBackupDates(c.env.MOLTBOT_BUCKET);
+    return c.json({ backups: dates, count: dates.length });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// POST /debug/admin/backups/run - Trigger daily backup now (for testing)
+debug.post('/admin/backups/run', async (c) => {
+  const adminSecret = c.req.header('X-Admin-Secret');
+  const expectedSecret = getGatewayMasterToken(c.env);
+  
+  if (!adminSecret || adminSecret !== expectedSecret) {
+    return c.json({ error: 'Admin access required' }, 403);
+  }
+
+  try {
+    const { createDailyBackup } = await import('../gateway/backup');
+    const result = await createDailyBackup(c.env);
+    return c.json(result);
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// POST /debug/admin/users/:userId/restore - Restore user from a backup date
+debug.post('/admin/users/:userId/restore', async (c) => {
+  const adminSecret = c.req.header('X-Admin-Secret');
+  const expectedSecret = getGatewayMasterToken(c.env);
+  
+  if (!adminSecret || adminSecret !== expectedSecret) {
+    return c.json({ error: 'Admin access required' }, 403);
+  }
+
+  const userId = c.req.param('userId');
+  const body = await c.req.json() as { date?: string };
+  const backupDate = body.date;
+  
+  if (!backupDate) {
+    return c.json({ error: 'Missing "date" in request body (format: YYYY-MM-DD)' }, 400);
+  }
+
+  try {
+    const { restoreUserFromBackup } = await import('../gateway/backup');
+    const result = await restoreUserFromBackup(c.env.MOLTBOT_BUCKET, userId, backupDate);
+    
+    if (result.success) {
+      return c.json({ 
+        success: true, 
+        userId, 
+        backupDate, 
+        filesRestored: result.filesRestored,
+        message: 'User data restored. Restart their container to apply changes.'
+      });
+    } else {
+      return c.json({ success: false, error: result.error }, 500);
+    }
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
 export { debug };

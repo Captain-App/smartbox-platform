@@ -1,13 +1,30 @@
 #!/bin/bash
 # Startup script for Moltbot in Cloudflare Sandbox
-# v2: Added allowInsecureAuth for proxy deployments
+# v3: Fixed concurrent startup race condition with lockfile
 # This script:
 # 1. Restores config from R2 backup if available
 # 2. Configures moltbot from environment variables
-# 3. Starts a background sync to backup config to R2
-# 4. Starts the gateway
+# 3. Starts the gateway
 
 set -e
+
+STARTUP_LOCK="/tmp/moltbot-startup.lock"
+
+# Use flock to prevent concurrent startup attempts
+# If another startup is in progress, wait up to 30s then exit
+exec 200>"$STARTUP_LOCK"
+if ! flock -w 30 200; then
+    echo "Another startup is in progress, exiting."
+    exit 0
+fi
+
+echo "=== Moltbot Startup $(date -Iseconds) ==="
+
+# Check if clawdbot gateway is already running - bail early if so
+if pgrep -f "clawdbot gateway" > /dev/null 2>&1; then
+    echo "Moltbot gateway is already running, exiting."
+    exit 0
+fi
 
 # ZOMBIE KILLER: Aggressively clean up any stale gateway processes
 # This prevents the "port 18789 already in use" crash loop
@@ -15,21 +32,21 @@ echo "Checking for zombie processes..."
 
 # Kill any clawdbot processes (graceful then force)
 pkill -f "clawdbot gateway" 2>/dev/null || true
+sleep 1
 pkill -9 -f "clawdbot" 2>/dev/null || true
 
 # Kill anything on port 18789
 fuser -k 18789/tcp 2>/dev/null || true
 
-# Clear all lock files
+# Clear all lock files (except our startup lock)
 rm -f /tmp/clawdbot*.lock /root/.clawdbot/*.lock /tmp/clawdbot-gateway.lock 2>/dev/null || true
 
 # Wait for cleanup
 sleep 2
 
-# Check if clawdbot gateway is already running - bail early if so
-# Note: CLI is still named "clawdbot" until upstream renames it
+# Double-check no gateway started while we were cleaning up
 if pgrep -f "clawdbot gateway" > /dev/null 2>&1; then
-    echo "Moltbot gateway is already running, exiting."
+    echo "Gateway started during cleanup, exiting."
     exit 0
 fi
 
@@ -156,20 +173,24 @@ should_restore_from_r2() {
     fi
 }
 
+# Check if we should restore from R2 ONCE before modifying any local state
+SHOULD_RESTORE=false
+if should_restore_from_r2; then
+    SHOULD_RESTORE=true
+fi
+
+# Restore config from R2 backup
 if [ -f "$BACKUP_DIR/clawdbot/clawdbot.json" ]; then
-    if should_restore_from_r2; then
+    if [ "$SHOULD_RESTORE" = true ]; then
         echo "Restoring from R2 backup at $BACKUP_DIR/clawdbot..."
         cp -a "$BACKUP_DIR/clawdbot/." "$CONFIG_DIR/"
-        # Copy the sync timestamp to local so we know what version we have
-        cp -f "$BACKUP_DIR/.last-sync" "$CONFIG_DIR/.last-sync" 2>/dev/null || true
         echo "Restored config from R2 backup"
     fi
 elif [ -f "$BACKUP_DIR/clawdbot.json" ]; then
     # Legacy backup format (flat structure)
-    if should_restore_from_r2; then
+    if [ "$SHOULD_RESTORE" = true ]; then
         echo "Restoring from legacy R2 backup at $BACKUP_DIR..."
         cp -a "$BACKUP_DIR/." "$CONFIG_DIR/"
-        cp -f "$BACKUP_DIR/.last-sync" "$CONFIG_DIR/.last-sync" 2>/dev/null || true
         echo "Restored config from legacy R2 backup"
     fi
 elif [ -d "$BACKUP_DIR" ]; then
@@ -178,15 +199,30 @@ else
     echo "R2 not mounted, starting fresh"
 fi
 
-# Restore skills from R2 backup if available (only if R2 is newer)
-SKILLS_DIR="/root/clawd/skills"
-if [ -d "$BACKUP_DIR/skills" ] && [ "$(ls -A $BACKUP_DIR/skills 2>/dev/null)" ]; then
-    if should_restore_from_r2; then
-        echo "Restoring skills from $BACKUP_DIR/skills..."
-        mkdir -p "$SKILLS_DIR"
-        cp -a "$BACKUP_DIR/skills/." "$SKILLS_DIR/"
-        echo "Restored skills from R2 backup"
+# Restore workspace from R2 backup if available
+# This includes scripts, skills, and any other user files in /root/clawd/
+WORKSPACE_DIR="/root/clawd"
+if [ -d "$BACKUP_DIR/workspace" ] && [ "$(ls -A $BACKUP_DIR/workspace 2>/dev/null)" ]; then
+    if [ "$SHOULD_RESTORE" = true ]; then
+        echo "Restoring workspace from $BACKUP_DIR/workspace..."
+        mkdir -p "$WORKSPACE_DIR"
+        cp -a "$BACKUP_DIR/workspace/." "$WORKSPACE_DIR/"
+        echo "Restored workspace from R2 backup"
     fi
+elif [ -d "$BACKUP_DIR/skills" ] && [ "$(ls -A $BACKUP_DIR/skills 2>/dev/null)" ]; then
+    # Legacy fallback: restore just skills if no workspace backup exists
+    if [ "$SHOULD_RESTORE" = true ]; then
+        echo "Restoring skills from legacy $BACKUP_DIR/skills..."
+        mkdir -p "$WORKSPACE_DIR/skills"
+        cp -a "$BACKUP_DIR/skills/." "$WORKSPACE_DIR/skills/"
+        echo "Restored skills from legacy R2 backup"
+    fi
+fi
+
+# Copy sync timestamp AFTER all restores complete
+if [ "$SHOULD_RESTORE" = true ]; then
+    cp -f "$BACKUP_DIR/.last-sync" "$CONFIG_DIR/.last-sync" 2>/dev/null || true
+    echo "Marked local state as synced with R2"
 fi
 
 # If config file still doesn't exist, create from template

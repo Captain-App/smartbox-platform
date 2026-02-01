@@ -40,6 +40,7 @@ import {
   checkHealth,
   shouldRestart,
   recordRestart,
+  createDailyBackup,
 } from './gateway';
 import {
   createIssue,
@@ -971,6 +972,20 @@ async function scheduled(
       console.error(`[cron] Error processing ${sandboxName}:`, err);
       issues.push({ userId, type: 'cron_error', error: errorMsg });
     }
+  }
+
+  // Run daily backup (idempotent - only runs once per day)
+  try {
+    const backupResult = await createDailyBackup(env);
+    if (backupResult.skipped) {
+      console.log(`[cron] Daily backup: skipped (${backupResult.skipReason})`);
+    } else if (backupResult.success) {
+      console.log(`[cron] Daily backup: ${backupResult.usersBackedUp} users, ${backupResult.filesBackedUp} files`);
+    } else {
+      console.error(`[cron] Daily backup failed: ${backupResult.error}`);
+    }
+  } catch (err) {
+    console.error(`[cron] Daily backup error:`, err);
   }
 
   // Log summary

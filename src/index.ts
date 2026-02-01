@@ -849,12 +849,46 @@ async function scheduled(
     try {
       const sandbox = getSandbox(env.Sandbox, sandboxName, options);
 
-      // Check if sandbox has any processes (skip if not active)
+      // Check if sandbox has any processes
       const processes = await sandbox.listProcesses();
       if (processes.length === 0) {
-        console.log(`[cron] Skipping ${sandboxName} - no active processes`);
-        skippedCount++;
-        continue;
+        // No processes - check if user has Telegram configured and auto-start if so
+        try {
+          const configKey = `users/${userId}/clawdbot/clawdbot.json`;
+          const configObj = await env.MOLTBOT_BUCKET.get(configKey);
+          if (configObj) {
+            const configText = await configObj.text();
+            const config = JSON.parse(configText);
+            const hasTelegram = config?.channels?.telegram?.botToken;
+            
+            if (hasTelegram) {
+              console.log(`[cron] Auto-starting gateway for ${sandboxName} - has Telegram configured but no processes`);
+              try {
+                await ensureMoltbotGateway(sandbox, env, userId);
+                console.log(`[cron] Auto-started gateway for ${sandboxName}`);
+                restartCount++;
+                // Continue to health check and sync
+              } catch (startErr) {
+                console.error(`[cron] Failed to auto-start ${sandboxName}:`, startErr);
+                issues.push({ userId, type: 'auto_start_failed', error: startErr instanceof Error ? startErr.message : 'Unknown error' });
+                skippedCount++;
+                continue;
+              }
+            } else {
+              console.log(`[cron] Skipping ${sandboxName} - no active processes and no Telegram`);
+              skippedCount++;
+              continue;
+            }
+          } else {
+            console.log(`[cron] Skipping ${sandboxName} - no active processes and no config`);
+            skippedCount++;
+            continue;
+          }
+        } catch (configErr) {
+          console.log(`[cron] Skipping ${sandboxName} - failed to check config: ${configErr}`);
+          skippedCount++;
+          continue;
+        }
       }
 
       // Run health check

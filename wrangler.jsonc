@@ -36,6 +36,12 @@
   // Each user gets their own sandbox instance (openclaw-{userId})
   "containers": [
     {
+      "class_name": "Sandbox",
+      "image": "./Dockerfile",
+      "instance_type": "standard-1",
+      "max_instances": 20,
+    },
+    {
       "class_name": "SandboxStandard1",
       "image": "./Dockerfile",
       "instance_type": "standard-1",
@@ -57,6 +63,10 @@
   "durable_objects": {
     "bindings": [
       {
+        "class_name": "Sandbox",
+        "name": "Sandbox",
+      },
+      {
         "class_name": "SandboxStandard1",
         "name": "SandboxStandard1",
       },
@@ -77,6 +87,10 @@
     },
     {
       "tag": "v3",
+    },
+    {
+      "new_sqlite_classes": ["SandboxStandard1", "SandboxStandard2", "SandboxStandard3"],
+      "tag": "v4",
     },
   ],
   // R2 bucket for persistent storage (moltbot data, conversations, etc.)

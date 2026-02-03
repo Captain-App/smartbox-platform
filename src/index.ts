@@ -304,6 +304,12 @@ app.route('/cdp', cdp);
 app.route('/relay', relayRoutes);
 
 // =============================================================================
+// SUPER ADMIN ROUTES: Protected by X-Admin-Secret header
+// =============================================================================
+import { adminRouter } from './routes';
+app.route('/api/super', adminRouter);
+
+// =============================================================================
 // PROTECTED ROUTES: Cloudflare Access authentication required
 // =============================================================================
 

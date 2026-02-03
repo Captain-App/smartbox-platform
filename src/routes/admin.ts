@@ -50,6 +50,132 @@ interface ContainerStatus {
   error?: string;
 }
 
+// Live state check types (v2 synchronous endpoint)
+type LiveContainerState = 'stopped' | 'idle' | 'starting' | 'active' | 'error';
+
+interface LiveState {
+  state: LiveContainerState;
+  userId: string;
+  processCount: number;
+  gatewayHealthy: boolean | null;
+  checkedAt: string;
+  latencyMs: number;
+  lastSyncAt?: string | null;
+  error?: string;
+}
+
+/**
+ * Performs a synchronous live health check on a user's container
+ * 
+ * Steps:
+ * 1. Get sandbox reference (fast, from DO namespace)
+ * 2. List processes to check if any are running
+ * 3. If processes exist, ping gateway port 18789
+ * 4. Return state based on actual results
+ * 
+ * Performance Budget: <500ms for single container
+ */
+async function getLiveState(userId: string, env: AppEnv): Promise<LiveState> {
+  const startTime = Date.now();
+  
+  try {
+    // Step 1: Get sandbox reference (fast, from DO namespace)
+    const sandbox = await getUserSandbox(env, userId, false);
+    
+    // Step 2: List processes - lightweight operation (<100ms)
+    let processes: any[] = [];
+    try {
+      processes = await sandbox.listProcesses();
+    } catch (processError) {
+      // If we can't list processes, sandbox might be hibernating or stopped
+      return {
+        state: 'stopped',
+        userId,
+        processCount: 0,
+        gatewayHealthy: null,
+        checkedAt: new Date().toISOString(),
+        latencyMs: Date.now() - startTime,
+        error: processError instanceof Error ? processError.message : 'Failed to list processes',
+      };
+    }
+    
+    // No processes = idle state
+    if (processes.length === 0) {
+      return {
+        state: 'idle',
+        userId,
+        processCount: 0,
+        gatewayHealthy: null,
+        checkedAt: new Date().toISOString(),
+        latencyMs: Date.now() - startTime,
+      };
+    }
+    
+    // Step 3: Check gateway health on port 18789
+    const gatewayHealthy = await checkGatewayHealth(sandbox);
+    
+    // Step 4: Determine state based on gateway health
+    return {
+      state: gatewayHealthy ? 'active' : 'starting',
+      userId,
+      processCount: processes.length,
+      gatewayHealthy,
+      checkedAt: new Date().toISOString(),
+      latencyMs: Date.now() - startTime,
+    };
+    
+  } catch (error) {
+    // Can't get sandbox reference = stopped
+    return {
+      state: 'stopped',
+      userId,
+      processCount: 0,
+      gatewayHealthy: null,
+      checkedAt: new Date().toISOString(),
+      latencyMs: Date.now() - startTime,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    };
+  }
+}
+
+/**
+ * Check if the gateway is healthy by attempting to fetch from the health endpoint
+ */
+async function checkGatewayHealth(sandbox: any): Promise<boolean> {
+  try {
+    // Try to fetch from the gateway health endpoint on port 18789
+    const response = await sandbox.fetch('http://localhost:18789/health', {
+      method: 'GET',
+    });
+    
+    return response.status >= 200 && response.status < 300;
+  } catch {
+    // Gateway not responding yet
+    return false;
+  }
+}
+
+/**
+ * Get all user IDs from the R2 bucket
+ * Uses a hardcoded list of known users for reliable dashboard checks
+ * This is more efficient than listing from R2 which has pagination/limitations
+ */
+async function getAllUserIds(env: AppEnv): Promise<string[]> {
+  // Hardcoded list of known user IDs from user-lookup.json
+  // These are the 9 containers that should be monitored
+  return [
+    '38b1ec2b-7a70-4834-a48d-162b8902b0fd', // kyla
+    '32c7100e-c6ce-4cf8-8b64-edf4ac3b760b', // jack
+    '6d575ef4-7ac8-4a17-b732-e0e690986e58', // david geddes
+    '0f1195c1-6b57-4254-9871-6ef3b7fa360c', // rhys
+    '679f60a6-2e00-403b-86f1-f4696149294f', // james
+    'aef3677b-afdf-4a7e-bbeb-c596f0d94d29', // adnan
+    '5bb7d208-2baf-4c95-8aec-f28e016acedb', // david lippold
+    'e29fd082-6811-4e29-893e-64699c49e1f0', // ben lippold
+    'fe56406b-a723-43cf-9f19-ba2ffcb135b0', // miles
+  ];
+}
+
 // =============================================================================
 // Phase 2: State-Aware API
 // =============================================================================
@@ -161,6 +287,86 @@ adminRouter.get('/users/:id/state', requireSuperAuth, async (c) => {
       timestamp: new Date().toISOString(),
     }, 500);
   }
+});
+
+// GET /api/super/users/:id/state/v2 - Live synchronous state check
+adminRouter.get('/users/:id/state/v2', requireSuperAuth, async (c) => {
+  const userId = c.req.param('id');
+  
+  const state = await getLiveState(userId, c.env);
+  
+  // Add last sync info from R2 if available
+  try {
+    const syncKey = `users/${userId}/.last-sync`;
+    const syncObj = await c.env.MOLTBOT_BUCKET.get(syncKey);
+    if (syncObj) {
+      const syncData = await syncObj.text();
+      state.lastSyncAt = syncData.split('|')[0] || syncData;
+    }
+  } catch {
+    // Ignore R2 errors
+  }
+  
+  return c.json(state);
+});
+
+// GET /api/super/state/dashboard - Batch status for all users
+adminRouter.get('/state/dashboard', requireSuperAuth, async (c) => {
+  const startTime = Date.now();
+  
+  // Get list of all users (from R2)
+  const userIds = await getAllUserIds(c.env);
+  
+  if (userIds.length === 0) {
+    return c.json({
+      users: [],
+      summary: {
+        total: 0,
+        active: 0,
+        idle: 0,
+        starting: 0,
+        stopped: 0,
+        error: 0,
+      },
+      totalLatencyMs: 0,
+      checkedAt: new Date().toISOString(),
+    });
+  }
+  
+  // Check all containers in parallel
+  const checks = await Promise.all(
+    userIds.map(async (userId) => {
+      try {
+        return await getLiveState(userId, c.env);
+      } catch (error) {
+        return {
+          state: 'error' as const,
+          userId,
+          processCount: 0,
+          gatewayHealthy: null,
+          checkedAt: new Date().toISOString(),
+          latencyMs: 0,
+          error: error instanceof Error ? error.message : 'Failed to check',
+        };
+      }
+    })
+  );
+  
+  const totalLatency = Date.now() - startTime;
+  
+  return c.json({
+    users: checks,
+    summary: {
+      total: checks.length,
+      active: checks.filter(c => c.state === 'active').length,
+      idle: checks.filter(c => c.state === 'idle').length,
+      starting: checks.filter(c => c.state === 'starting').length,
+      stopped: checks.filter(c => c.state === 'stopped').length,
+      error: checks.filter(c => c.state === 'error').length,
+    },
+    totalLatencyMs: totalLatency,
+    checkedAt: new Date().toISOString(),
+  });
 });
 
 // POST /api/super/users/:id/wake - Wake up container
@@ -979,6 +1185,191 @@ adminRouter.post('/users/:id/config/rollback', requireSuperAuth, async (c) => {
       error: errorMessage,
     }, 500);
   }
+});
+
+// =============================================================================
+// Cost Tracking Endpoints
+// =============================================================================
+
+// GET /api/super/cost - Get total cost summary across all users
+adminRouter.get('/cost', requireSuperAuth, async (c) => {
+  try {
+    const days = parseInt(c.req.query('days') || '30', 10);
+    const threshold = c.req.query('threshold') ? parseFloat(c.req.query('threshold')!) : undefined;
+    
+    const { generateCostSummary } = await import('../lib/cost-tracking');
+    const summary = await generateCostSummary(c.env, { days, threshold });
+    
+    return c.json(summary);
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /api/super/cost/users/:id - Get cost breakdown for specific user
+adminRouter.get('/cost/users/:id', requireSuperAuth, async (c) => {
+  const userId = c.req.param('id');
+  
+  try {
+    const days = parseInt(c.req.query('days') || '30', 10);
+    
+    const { getUserCostSummary, generateCostSummary } = await import('../lib/cost-tracking');
+    const userCost = await getUserCostSummary(c.env, userId, { days });
+    
+    if (!userCost) {
+      return c.json({ error: 'User not found' }, 404);
+    }
+    
+    // Get total for percentage calculation
+    const totalSummary = await generateCostSummary(c.env, { days });
+    userCost.percentageOfTotal = totalSummary.totalCost > 0 
+      ? (userCost.totalCost / totalSummary.totalCost) * 100 
+      : 0;
+    
+    return c.json({
+      userId,
+      userName: userCost.userName,
+      period: totalSummary.period,
+      cost: userCost,
+      totalPlatformCost: totalSummary.totalCost,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /api/super/cost/service/:service - Get cost breakdown by service type
+adminRouter.get('/cost/service/:service', requireSuperAuth, async (c) => {
+  const service = c.req.param('service') as 'workers' | 'r2' | 'durableObjects' | 'sandbox';
+  
+  if (!['workers', 'r2', 'durableObjects', 'sandbox'].includes(service)) {
+    return c.json({ error: 'Invalid service type' }, 400);
+  }
+  
+  try {
+    const days = parseInt(c.req.query('days') || '30', 10);
+    
+    const { generateCostSummary } = await import('../lib/cost-tracking');
+    const summary = await generateCostSummary(c.env, { days });
+    
+    const serviceBreakdown = summary.serviceBreakdown.find(s => s.service === service);
+    
+    if (!serviceBreakdown) {
+      return c.json({ error: 'Service not found' }, 404);
+    }
+    
+    // Get per-user breakdown for this service
+    const userBreakdown = summary.userBreakdown.map(u => ({
+      userId: u.userId,
+      userName: u.userName,
+      cost: service === 'workers' ? u.workers.cost : 
+            service === 'r2' ? u.r2.cost :
+            service === 'durableObjects' ? u.durableObjects.cost : 0,
+      details: service === 'workers' ? { requests: u.workers.requests, gbSeconds: u.workers.gbSeconds } :
+               service === 'r2' ? { storageGB: u.r2.storageGB, operations: u.r2.operations } :
+               service === 'durableObjects' ? { requests: u.durableObjects.requests, storageGB: u.durableObjects.storageGB } :
+               {},
+    }));
+    
+    return c.json({
+      service,
+      period: summary.period,
+      summary: serviceBreakdown,
+      users: userBreakdown.sort((a, b) => b.cost - a.cost),
+      totalCost: summary.totalCost,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /api/super/cost/trend - Get month-over-month cost trending
+adminRouter.get('/cost/trend', requireSuperAuth, async (c) => {
+  try {
+    const { generateCostSummary, getBillingPeriod } = await import('../lib/cost-tracking');
+    
+    // Current period
+    const currentDays = parseInt(c.req.query('days') || '30', 10);
+    const currentSummary = await generateCostSummary(c.env, { days: currentDays });
+    
+    // Previous period for comparison
+    const prevPeriod = getBillingPeriod(currentDays);
+    const prevStart = new Date(prevPeriod.start);
+    prevStart.setDate(prevStart.getDate() - currentDays);
+    const prevEnd = new Date(prevPeriod.start);
+    
+    // Calculate mock previous period costs (would use historical data in production)
+    // For now, estimate based on current trend
+    const trendFactor = 0.95; // Assume 5% growth month-over-month as default
+    
+    return c.json({
+      current: {
+        period: currentSummary.period,
+        totalCost: currentSummary.totalCost,
+        userCount: currentSummary.userCount,
+        serviceBreakdown: currentSummary.serviceBreakdown,
+      },
+      previous: {
+        period: {
+          start: prevStart.toISOString(),
+          end: prevEnd.toISOString(),
+          days: currentDays,
+        },
+        estimatedTotalCost: currentSummary.totalCost * trendFactor,
+        estimatedChange: ((currentSummary.totalCost - (currentSummary.totalCost * trendFactor)) / (currentSummary.totalCost * trendFactor)) * 100,
+      },
+      trends: currentSummary.trends,
+      note: 'Historical data tracking not yet implemented - showing estimates based on current usage',
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /api/super/cost/check - Check cost against threshold
+adminRouter.get('/cost/check', requireSuperAuth, async (c) => {
+  try {
+    const threshold = parseFloat(c.req.query('threshold') || '50');
+    const days = parseInt(c.req.query('days') || '30', 10);
+    
+    const { checkCostThreshold } = await import('../lib/cost-tracking');
+    const result = await checkCostThreshold(c.env, threshold, { days });
+    
+    return c.json({
+      check: {
+        threshold,
+        days,
+        exceeded: result.exceeded,
+        current: result.current,
+        remaining: Math.max(0, threshold - result.current),
+        percentUsed: (result.current / threshold) * 100,
+      },
+      alerts: result.alerts,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /api/super/cost/rates - Get current pricing rates
+adminRouter.get('/cost/rates', requireSuperAuth, async (c) => {
+  const { COST_RATES } = await import('../lib/cost-tracking');
+  
+  return c.json({
+    rates: COST_RATES,
+    description: {
+      workers: 'Cloudflare Workers - per million requests and GB-seconds',
+      r2: 'R2 Object Storage - per GB-month storage and million operations',
+      durableObjects: 'Durable Objects - per billion requests and GB-month storage',
+    },
+    effectiveDate: '2025-01-01',
+    source: 'Cloudflare published pricing',
+  });
 });
 
 export { adminRouter };

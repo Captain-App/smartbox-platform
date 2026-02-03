@@ -1133,8 +1133,32 @@ debug.post('/admin/users/:userId/fix-secrets', async (c) => {
 // GET /debug/admin/users/:userId/r2-backup - Read user's R2 backup directly
 debug.get('/admin/users/:userId/r2-backup', async (c) => {
   const userId = c.req.param('userId');
+  const path = c.req.query('path') || '';
 
   try {
+    // If a specific file path is provided, read it directly
+    if (path && !path.endsWith('/')) {
+      const fileKey = `users/${userId}/${path}`;
+      try {
+        const fileObj = await c.env.MOLTBOT_BUCKET.get(fileKey);
+        if (fileObj) {
+          const content = await fileObj.text();
+          return c.json({
+            userId,
+            path: fileKey,
+            size: content.length,
+            content: content.substring(0, 100000), // Limit to 100KB
+            truncated: content.length > 100000
+          });
+        } else {
+          return c.json({ error: 'File not found', path: fileKey }, 404);
+        }
+      } catch (e) {
+        return c.json({ error: 'Failed to read file', details: e instanceof Error ? e.message : 'Unknown' }, 500);
+      }
+    }
+    
+    // Otherwise, list files or read default config
     // Read config from R2
     const configKey = `users/${userId}/clawdbot/clawdbot.json`;
     const configObj = await c.env.MOLTBOT_BUCKET.get(configKey);
@@ -1143,8 +1167,9 @@ debug.get('/admin/users/:userId/r2-backup', async (c) => {
     const syncKey = `users/${userId}/.last-sync`;
     const syncObj = await c.env.MOLTBOT_BUCKET.get(syncKey);
 
-    // List all files for this user
-    const listed = await c.env.MOLTBOT_BUCKET.list({ prefix: `users/${userId}/` });
+    // List all files for this user (or specific prefix if path is a directory)
+    const prefix = path ? `users/${userId}/${path}` : `users/${userId}/`;
+    const listed = await c.env.MOLTBOT_BUCKET.list({ prefix });
     const files = listed.objects.map(o => ({ key: o.key, size: o.size, uploaded: o.uploaded }));
 
     let config = null;
@@ -1507,6 +1532,269 @@ debug.post('/admin/users/:userId/restore', async (c) => {
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /debug/admin/users/:userId/sessions - Get user's session history with message activity
+debug.get('/admin/users/:userId/sessions', async (c) => {
+  const userId = c.req.param('userId');
+  const { getSandbox } = await import('@cloudflare/sandbox');
+  const sandboxName = `openclaw-${userId}`;
+  
+  try {
+    const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: false });
+    
+    // Session files are in ~/.clawdbot/agents/*/sessions/
+    const agentsDir = '/root/.clawdbot/agents';
+    let sessions: Array<{
+      sessionId: string;
+      lastActivity: string | null;
+      messageCount: number;
+      channel: string | null;
+      agentKind: string | null;
+      filePath: string;
+    }> = [];
+    
+    try {
+      // Find all session files recursively
+      const findProc = await sandbox.startProcess(`find ${agentsDir} -name "*.jsonl" -type f 2>/dev/null`);
+      await new Promise(r => setTimeout(r, 2000));
+      const findLogs = await findProc.getLogs();
+      
+      const sessionFiles = (findLogs.stdout || '')
+        .split('\n')
+        .filter(line => line.trim().endsWith('.jsonl'));
+      
+      // For each session file, get basic stats
+      for (const filePath of sessionFiles.slice(0, 20)) { // Limit to 20 most recent
+        const parts = filePath.split('/');
+        const fileName = parts[parts.length - 1];
+        const sessionId = fileName.replace('.jsonl', '');
+        const agentKind = parts.length > 3 ? parts[parts.length - 3] : null;
+        
+        // Count messages
+        const wcProc = await sandbox.startProcess(`wc -l "${filePath}"`);
+        await new Promise(r => setTimeout(r, 300));
+        const wcLogs = await wcProc.getLogs();
+        const lineCount = parseInt((wcLogs.stdout || '0').split(' ')[0]) || 0;
+        
+        // Get last line for timestamp and channel
+        const tailProc = await sandbox.startProcess(`tail -1 "${filePath}"`);
+        await new Promise(r => setTimeout(r, 300));
+        const tailLogs = await tailProc.getLogs();
+        let lastActivity: string | null = null;
+        let channel: string | null = null;
+        
+        try {
+          const lastLine = tailLogs.stdout;
+          if (lastLine) {
+            const parsed = JSON.parse(lastLine);
+            lastActivity = parsed.timestamp || null;
+            // Extract channel from various possible locations
+            if (parsed.channel) channel = parsed.channel;
+            else if (parsed.content?.channel) channel = parsed.content.channel;
+            else if (parsed.content?.channelId) channel = parsed.content.channelId;
+            else if (parsed.deliveryContext?.channel) channel = parsed.deliveryContext.channel;
+            else if (parsed.message?.deliveryContext?.channel) channel = parsed.message.deliveryContext.channel;
+          }
+        } catch {
+          // Ignore parse errors
+        }
+        
+        sessions.push({
+          sessionId,
+          lastActivity,
+          messageCount: lineCount,
+          channel,
+          agentKind,
+          filePath,
+        });
+      }
+      
+      // Sort by last activity (newest first)
+      sessions.sort((a, b) => {
+        if (!a.lastActivity) return 1;
+        if (!b.lastActivity) return -1;
+        return new Date(b.lastActivity).getTime() - new Date(a.lastActivity).getTime();
+      });
+      
+    } catch (e) {
+      // Container might not be running or accessible
+      console.log('[sessions] Error finding sessions:', e);
+    }
+    
+    // Also check R2 backup for any sessions not in active container
+    const r2Sessions: typeof sessions = [];
+    try {
+      const r2Prefix = `users/${userId}/`;
+      const r2List = await c.env.MOLTBOT_BUCKET.list({ prefix: r2Prefix });
+      
+      for (const obj of r2List.objects?.filter(o => o.key.endsWith('.jsonl')).slice(0, 5) || []) {
+        const sessionId = obj.key.split('/').pop()?.replace('.jsonl', '') || 'unknown';
+        // Only add if not already in active sessions
+        if (!sessions.find(s => s.sessionId === sessionId)) {
+          // ACTUALLY READ THE R2 FILE to get message count
+          let messageCount = 0;
+          let lastActivity = obj.uploaded?.toISOString() || null;
+          let channel: string | null = 'R2_backup';
+          
+          try {
+            const r2Obj = await c.env.MOLTBOT_BUCKET.get(obj.key);
+            if (r2Obj) {
+              const content = await r2Obj.text();
+              const lines = content.split('\n').filter(l => l.trim());
+              messageCount = lines.length;
+              
+              // Parse last line for timestamp
+              if (lines.length > 0) {
+                const lastLine = lines[lines.length - 1];
+                try {
+                  const parsed = JSON.parse(lastLine);
+                  if (parsed.timestamp) lastActivity = parsed.timestamp;
+                  // Try to find channel
+                  if (parsed.channel) channel = parsed.channel;
+                  else if (parsed.message?.deliveryContext?.channel) channel = parsed.message.deliveryContext.channel;
+                } catch {
+                  // Ignore parse errors
+                }
+              }
+            }
+          } catch (e) {
+            console.log(`[sessions] Error reading R2 file ${obj.key}:`, e);
+          }
+          
+          r2Sessions.push({
+            sessionId,
+            lastActivity,
+            messageCount,
+            channel,
+            agentKind: null,
+            filePath: obj.key,
+          });
+        }
+      }
+    } catch (e) {
+      // R2 might not be configured
+      console.log('[sessions] R2 check error:', e);
+    }
+    
+    return c.json({
+      userId,
+      activeSessions: sessions.length,
+      r2BackupSessions: r2Sessions.length,
+      sessions: sessions.slice(0, 5),
+      r2Sessions: r2Sessions.slice(0, 3),
+      totalMessages: sessions.reduce((sum, s) => sum + s.messageCount, 0),
+      lastActivity: sessions[0]?.lastActivity || r2Sessions[0]?.lastActivity || null,
+    });
+    
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage, userId }, 500);
+  }
+});
+
+// GET /debug/admin/users/:userId/sessions/:sessionId/messages - Get messages from a session with FIXED parsing
+debug.get('/admin/users/:userId/sessions/:sessionId/messages', async (c) => {
+  const userId = c.req.param('userId');
+  const sessionId = c.req.param('sessionId');
+  const limit = parseInt(c.req.query('limit') || '50');
+  
+  const { getSandbox } = await import('@cloudflare/sandbox');
+  const sandboxName = `openclaw-${userId}`;
+  
+  try {
+    const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: false });
+    
+    // Find the session file in agents directory
+    const findProc = await sandbox.startProcess(`find /root/.clawdbot/agents -name "${sessionId}.jsonl" -type f 2>/dev/null`);
+    await new Promise(r => setTimeout(r, 2000));
+    const findLogs = await findProc.getLogs();
+    const sessionFile = (findLogs.stdout || '').trim().split('\n')[0];
+    
+    if (!sessionFile) {
+      return c.json({ error: 'Session file not found', userId, sessionId }, 404);
+    }
+    
+    // Get last N lines from session file
+    const tailProc = await sandbox.startProcess(`tail -${limit} "${sessionFile}"`);
+    await new Promise(r => setTimeout(r, 2000));
+    const logs = await tailProc.getLogs();
+    
+    const lines = (logs.stdout || '').split('\n').filter(line => line.trim());
+    
+    // Parse each line and extract message info with FIXED parsing
+    const messages = lines.map(line => {
+      try {
+        const m = JSON.parse(line);
+        
+        // Handle the nested message structure from Clawdbot sessions
+        // Session format: { type: "message", message: { role: "user", content: [...] } }
+        const isSessionMessage = m.type === 'message' && m.message;
+        const msgData = isSessionMessage ? m.message : m;
+        
+        // Extract content properly
+        let preview = '[non-text content]';
+        let hasToolCall = false;
+        let isThinking = false;
+        
+        if (msgData.content && Array.isArray(msgData.content)) {
+          // Find text content
+          const textContent = msgData.content.find((c: any) => c.type === 'text' && c.text);
+          if (textContent) {
+            preview = textContent.text.substring(0, 100);
+          }
+          
+          // Check for tool calls
+          hasToolCall = msgData.content.some((c: any) => c.type === 'tool_call' || c.type === 'toolResult');
+          
+          // Check for thinking
+          const thinkingContent = msgData.content.find((c: any) => c.type === 'thinking');
+          if (thinkingContent) {
+            isThinking = true;
+            preview = '[thinking]';
+          }
+          
+          // Check for user text in message.content
+          if (msgData.role === 'user' && textContent) {
+            preview = textContent.text.substring(0, 100);
+          }
+        } else if (typeof msgData.content === 'string') {
+          preview = msgData.content.substring(0, 100);
+        }
+        
+        // Extract channel from various locations
+        let channel = m.channel || m.content?.channel;
+        if (!channel && msgData.content?.channel) channel = msgData.content.channel;
+        if (!channel && m.deliveryContext?.channel) channel = m.deliveryContext.channel;
+        if (!channel && msgData.deliveryContext?.channel) channel = msgData.deliveryContext.channel;
+        if (!channel && msgData.message?.deliveryContext?.channel) channel = msgData.message.deliveryContext.channel;
+        
+        return {
+          timestamp: m.timestamp || msgData.timestamp,
+          role: msgData.role || m.role,
+          channel,
+          messageType: m.type || msgData.type,
+          hasToolCall,
+          isThinking,
+          preview,
+        };
+      } catch (e) {
+        return { raw: line, parseError: true, preview: '[parse error]' };
+      }
+    });
+    
+    return c.json({
+      userId,
+      sessionId,
+      sessionFile,
+      messageCount: messages.length,
+      messages,
+    });
+    
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage, userId, sessionId }, 500);
   }
 });
 

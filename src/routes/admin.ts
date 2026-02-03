@@ -397,10 +397,10 @@ adminRouter.post('/users/:id/exec', requireSuperAuth, async (c) => {
 // Phase 1: Native File Operations
 // =============================================================================
 
-// GET /api/super/users/:id/files/* - Read file using native SDK
-adminRouter.get('/users/:id/files/*', requireSuperAuth, async (c) => {
+// GET /api/super/users/:id/files/:path{.+} - Read file using native SDK
+adminRouter.get('/users/:id/files/:path{.+}', requireSuperAuth, async (c) => {
   const userId = c.req.param('id');
-  const path = c.req.param('*') || '';
+  const path = c.req.param('path') || '';
   
   if (!path) {
     return c.json({ error: 'File path is required' }, 400);
@@ -466,12 +466,10 @@ adminRouter.get('/users/:id/files/*', requireSuperAuth, async (c) => {
   });
 });
 
-// HEAD /api/super/users/:id/files/* - Check file exists and get metadata
-adminRouter.get('/users/:id/files/*/exists', requireSuperAuth, async (c) => {
+// HEAD /api/super/users/:id/files/:path{.+}/exists - Check file exists and get metadata
+adminRouter.get('/users/:id/files/:path{.+}/exists', requireSuperAuth, async (c) => {
   const userId = c.req.param('id');
-  const pathParam = c.req.param('*') || '';
-  // Remove the trailing '/exists' from the path
-  const path = pathParam.replace(/\/exists$/, '');
+  const path = c.req.param('path') || '';
   
   if (!path) {
     return c.json({ error: 'File path is required' }, 400);
@@ -509,10 +507,10 @@ adminRouter.get('/users/:id/files/*/exists', requireSuperAuth, async (c) => {
   });
 });
 
-// PUT /api/super/users/:id/files/* - Write file using native SDK
-adminRouter.put('/users/:id/files/*', requireSuperAuth, async (c) => {
+// PUT /api/super/users/:id/files/:path{.+} - Write file using native SDK
+adminRouter.put('/users/:id/files/:path{.+}', requireSuperAuth, async (c) => {
   const userId = c.req.param('id');
-  const path = c.req.param('*') || '';
+  const path = c.req.param('path') || '';
   
   if (!path) {
     return c.json({ error: 'File path is required' }, 400);
@@ -583,10 +581,10 @@ adminRouter.put('/users/:id/files/*', requireSuperAuth, async (c) => {
   });
 });
 
-// DELETE /api/super/users/:id/files/* - Delete file
-adminRouter.delete('/users/:id/files/*', requireSuperAuth, async (c) => {
+// DELETE /api/super/users/:id/files/:path{.+} - Delete file
+adminRouter.delete('/users/:id/files/:path{.+}', requireSuperAuth, async (c) => {
   const userId = c.req.param('id');
-  const path = c.req.param('*') || '';
+  const path = c.req.param('path') || '';
   
   if (!path) {
     return c.json({ error: 'File path is required' }, 400);

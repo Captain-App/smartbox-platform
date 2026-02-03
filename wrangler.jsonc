@@ -119,9 +119,11 @@
       "migrations_dir": "migrations",
     },
   ],
-  // Cron trigger to sync all user data to R2 every 1 minute
+  // Cron triggers:
+  // 1. R2 sync every minute (keeps data fresh)
+  // 2. Rolling backup every 20 minutes (20 backups/day, 7 day retention = 140 backups)
   "triggers": {
-    "crons": ["* * * * *"],
+    "crons": ["* * * * *", "*/20 * * * *"],
   },
   // Browser Rendering binding for CDP shim
   "browser": {

@@ -41,6 +41,7 @@ import {
   shouldRestart,
   recordRestart,
   createDailyBackup,
+  createRollingBackup,
   getSandboxForUser,
   getInstanceTypeName,
 } from './gateway';
@@ -1023,6 +1024,20 @@ async function scheduled(
       console.error(`[cron] Error processing ${sandboxName}:`, err);
       issues.push({ userId, type: 'cron_error', error: errorMsg });
     }
+  }
+
+  // Run rolling 20-minute backup (idempotent - only runs once per 20-min slot)
+  try {
+    const rollingResult = await createRollingBackup(env);
+    if (rollingResult.skipped) {
+      console.log(`[cron] Rolling backup: skipped (${rollingResult.skipReason})`);
+    } else if (rollingResult.success) {
+      console.log(`[cron] Rolling backup: ${rollingResult.usersBackedUp} users, ${rollingResult.filesBackedUp} files at ${rollingResult.date}`);
+    } else {
+      console.error(`[cron] Rolling backup failed: ${rollingResult.error}`);
+    }
+  } catch (err) {
+    console.error(`[cron] Rolling backup error:`, err);
   }
 
   // Run daily backup (idempotent - only runs once per day)

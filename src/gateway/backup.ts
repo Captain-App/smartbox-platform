@@ -6,7 +6,9 @@
 import type { MoltbotEnv } from '../types';
 
 const BACKUP_RETENTION_DAYS = 7;
-const BACKUP_MARKER_KEY = 'backups/.last-daily-backup';
+const BACKUP_RETENTION_MINUTES = 20; // Rolling backup every 20 minutes
+const BACKUP_MARKER_KEY = 'backups/.last-rolling-backup';
+const ROLLING_BACKUP_ENABLED = true;
 
 interface BackupResult {
   success: boolean;
@@ -101,6 +103,153 @@ async function cleanupOldBackups(bucket: R2Bucket): Promise<number> {
   }
   
   return deleted;
+}
+
+/**
+ * Get current timestamp in YYYY-MM-DD-HH-MM format (UTC)
+ */
+function getCurrentTimestamp(): string {
+  const now = new Date();
+  const date = now.toISOString().split('T')[0];
+  const hours = String(now.getUTCHours()).padStart(2, '0');
+  const minutes = String(Math.floor(now.getUTCMinutes() / 20) * 20).padStart(2, '0'); // Round to 20-min slot
+  return `${date}-${hours}-${minutes}`;
+}
+
+/**
+ * Check if rolling backup has run in the last 20 minutes
+ */
+async function hasRollingBackupRunRecently(bucket: R2Bucket): Promise<boolean> {
+  try {
+    const marker = await bucket.get(BACKUP_MARKER_KEY);
+    if (!marker) return false;
+    
+    const lastBackup = await marker.text();
+    const currentSlot = getCurrentTimestamp();
+    
+    // Check if we're in the same 20-minute slot
+    return lastBackup.trim() === currentSlot;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Clean up old rolling backups (keep 7 days worth, ~500 backups)
+ */
+async function cleanupOldRollingBackups(bucket: R2Bucket): Promise<number> {
+  const cutoffDate = new Date();
+  cutoffDate.setDate(cutoffDate.getDate() - BACKUP_RETENTION_DAYS);
+  const cutoffStr = cutoffDate.toISOString().split('T')[0].replace(/-/g, '');
+  
+  let deleted = 0;
+  
+  try {
+    // List all backup timestamps
+    const listed = await bucket.list({ prefix: 'backups/', delimiter: '/' });
+    
+    for (const prefix of listed.delimitedPrefixes || []) {
+      // Extract timestamp from prefix like "backups/2026-02-03-22-00/"
+      const match = prefix.match(/^backups\/(\d{4}-\d{2}-\d{2}-\d{2}-\d{2})\/$/);
+      if (match) {
+        const timestamp = match[1].replace(/-/g, '');
+        const datePart = timestamp.substring(0, 8);
+        
+        if (datePart < cutoffStr) {
+          console.log(`[backup] Cleaning up old rolling backup: ${prefix}`);
+          
+          // List and delete all objects under this timestamp
+          let cursor: string | undefined;
+          do {
+            const objects = await bucket.list({ prefix, cursor });
+            for (const obj of objects.objects) {
+              await bucket.delete(obj.key);
+              deleted++;
+            }
+            cursor = objects.truncated ? objects.cursor : undefined;
+          } while (cursor);
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`[backup] Rolling cleanup error: ${err}`);
+  }
+  
+  return deleted;
+}
+
+/**
+ * Create a rolling 20-minute backup of all user data
+ * Copies users/* to backups/{timestamp}/users/*
+ * This provides 72 backups per day, 500+ over 7 days
+ */
+export async function createRollingBackup(env: MoltbotEnv): Promise<BackupResult> {
+  if (!ROLLING_BACKUP_ENABLED) {
+    return { success: true, date: getCurrentTimestamp(), usersBackedUp: 0, filesBackedUp: 0, skipped: true, skipReason: 'Rolling backup disabled' };
+  }
+  
+  const timestamp = getCurrentTimestamp();
+  const bucket = env.MOLTBOT_BUCKET;
+  
+  if (!bucket) {
+    return { success: false, date: timestamp, usersBackedUp: 0, filesBackedUp: 0, error: 'R2 bucket not configured' };
+  }
+  
+  // Check if already backed up in this 20-minute slot
+  if (await hasRollingBackupRunRecently(bucket)) {
+    console.log(`[backup] Rolling backup already completed for ${timestamp}`);
+    return { success: true, date: timestamp, usersBackedUp: 0, filesBackedUp: 0, skipped: true, skipReason: 'Already backed up in this slot' };
+  }
+  
+  console.log(`[backup] Starting rolling 20-min backup for ${timestamp}`);
+  
+  let usersBackedUp = 0;
+  let filesBackedUp = 0;
+  const usersSeen = new Set<string>();
+  
+  try {
+    // List all user data
+    let cursor: string | undefined;
+    do {
+      const listed = await bucket.list({ prefix: 'users/', cursor });
+      
+      for (const obj of listed.objects) {
+        // Skip if it's just a directory marker
+        if (obj.key.endsWith('/') && obj.size === 0) continue;
+        
+        // Track unique users
+        const userMatch = obj.key.match(/^users\/([^/]+)\//);
+        if (userMatch) {
+          usersSeen.add(userMatch[1]);
+        }
+        
+        // Copy to backup location
+        const backupKey = `backups/${timestamp}/${obj.key}`;
+        if (await copyObject(bucket, obj.key, backupKey)) {
+          filesBackedUp++;
+        }
+      }
+      
+      cursor = listed.truncated ? listed.cursor : undefined;
+    } while (cursor);
+    
+    usersBackedUp = usersSeen.size;
+    
+    // Update the backup marker
+    await bucket.put(BACKUP_MARKER_KEY, timestamp);
+    
+    // Cleanup old rolling backups
+    const deleted = await cleanupOldRollingBackups(bucket);
+    console.log(`[backup] Cleaned up ${deleted} old rolling backup files`);
+    
+    console.log(`[backup] Rolling backup complete: ${usersBackedUp} users, ${filesBackedUp} files at ${timestamp}`);
+    
+    return { success: true, date: timestamp, usersBackedUp, filesBackedUp };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : 'Unknown error';
+    console.error(`[backup] Rolling backup failed: ${error}`);
+    return { success: false, date: timestamp, usersBackedUp, filesBackedUp, error };
+  }
 }
 
 /**

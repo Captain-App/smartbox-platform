@@ -139,18 +139,22 @@ async function getLiveState(userId: string, env: AppEnv): Promise<LiveState> {
 }
 
 /**
- * Check if the gateway is healthy by attempting to fetch from the health endpoint
+ * Check if the gateway is healthy by attempting to connect via containerFetch
+ * Port 18789 serves both WebSocket and HTTP traffic - any response means it's alive
  */
 async function checkGatewayHealth(sandbox: any): Promise<boolean> {
   try {
-    // Try to fetch from the gateway health endpoint on port 18789
-    const response = await sandbox.fetch('http://localhost:18789/health', {
-      method: 'GET',
-    });
+    // Use containerFetch to check if the gateway responds on port 18789
+    // This matches how the main app actually communicates with the gateway
+    const response = await sandbox.containerFetch(
+      new Request('http://localhost:18789/'),
+      18789
+    );
     
-    return response.status >= 200 && response.status < 300;
+    // Any non-zero status means the server responded (even 404 is OK)
+    return response.status > 0;
   } catch {
-    // Gateway not responding yet
+    // Connection refused or timeout = gateway not healthy
     return false;
   }
 }

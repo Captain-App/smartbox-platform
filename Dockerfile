@@ -33,8 +33,8 @@ RUN mkdir -p /root/.openclaw \
     && mkdir -p /root/openclaw/skills
 
 # Copy startup script
-# Build cache bust: 2026-02-01-v10-restore-once-at-start
-ARG BUILD_VERSION=v10
+# Build cache bust: 2026-02-04-v11-increased-r2-wait
+ARG BUILD_VERSION=v11
 COPY start-moltbot.sh /usr/local/bin/start-moltbot.sh
 RUN chmod +x /usr/local/bin/start-moltbot.sh
 

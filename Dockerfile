@@ -20,16 +20,14 @@ RUN ARCH="$(dpkg --print-architecture)" \
 # Install pnpm globally
 RUN npm install -g pnpm
 
-# Install openclaw from local Captain-App fork
-# Copy and build from source to get latest changes
-COPY openclaw-source/ /tmp/openclaw-source/
-RUN cd /tmp/openclaw-source \
-    && npm install --ignore-scripts \
-    && npx tsdown \
-    && npm link \
-    && npm link openclaw -g \
-    && openclaw --version \
-    && rm -rf /tmp/openclaw-source
+# Install openclaw from pre-built package
+# The openclaw-source/dist folder is built locally and copied here
+COPY openclaw-dist/ /usr/local/lib/node_modules/openclaw/
+RUN cd /usr/local/lib/node_modules/openclaw \
+    && npm install --production --ignore-scripts \
+    && ln -s /usr/local/lib/node_modules/openclaw/dist/cli.mjs /usr/local/bin/openclaw \
+    && chmod +x /usr/local/bin/openclaw \
+    && openclaw --version
 
 # Create openclaw directories
 # Templates are stored in /root/.openclaw-templates for initialization

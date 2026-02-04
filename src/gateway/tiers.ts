@@ -34,7 +34,7 @@ const USER_TIER_MAP: Record<string, 1 | 2 | 3> = {
 // Migration requires: R2 sync → stop old → start new → verify
 const MIGRATED_USERS = new Set<string>([
   // Tiered routing rollout - 2026-02-04
-  '32c7100e-c6ce-4cf8-8b64-edf4ac3b760b', // Jack - standard-3
+  // '32c7100e-c6ce-4cf8-8b64-edf4ac3b760b', // Jack - rollback to legacy for debugging
   '81bf6a68-28fe-48ef-b257-f9ad013e6298', // Josh - standard-2
   'fe56406b-a723-43cf-9f19-ba2ffcb135b0', // Miles - standard-2
 ]);

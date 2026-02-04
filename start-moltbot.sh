@@ -44,6 +44,12 @@ rm -f /tmp/openclaw*.lock /root/.openclaw/*.lock /tmp/openclaw-gateway.lock 2>/d
 # Wait for cleanup
 sleep 2
 
+# Apply CaptainApp provider patch
+if [ -f /usr/local/lib/node_modules/openclaw-captainapp-patch.js ]; then
+    echo "Applying CaptainApp provider patch..."
+    node /usr/local/lib/node_modules/openclaw-captainapp-patch.js || echo "Patch may already be applied"
+fi
+
 # Double-check no gateway started while we were cleaning up
 if pgrep -f "openclaw gateway" > /dev/null 2>&1; then
     echo "Gateway started during cleanup, exiting."

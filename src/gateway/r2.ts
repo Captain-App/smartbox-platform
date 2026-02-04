@@ -1,6 +1,6 @@
 import type { Sandbox } from '@cloudflare/sandbox';
 import type { MoltbotEnv } from '../types';
-import { R2_MOUNT_PATH, R2_BUCKET_NAME, getR2MountPathForUser } from '../config';
+import { R2_MOUNT_PATH, getR2BucketName, getR2MountPathForUser } from '../config';
 
 /**
  * Options for mounting R2 storage
@@ -65,9 +65,10 @@ export async function mountR2Storage(
     return true;
   }
 
+  const bucketName = getR2BucketName(env);
   try {
-    console.log('Mounting R2 bucket at', mountPath);
-    await sandbox.mountBucket(R2_BUCKET_NAME, mountPath, {
+    console.log('Mounting R2 bucket', bucketName, 'at', mountPath);
+    await sandbox.mountBucket(bucketName, mountPath, {
       endpoint: `https://${env.CF_ACCOUNT_ID}.r2.cloudflarestorage.com`,
       // Pass credentials explicitly since we use R2_* naming instead of AWS_*
       credentials: {

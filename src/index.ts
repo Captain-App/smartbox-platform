@@ -56,6 +56,7 @@ import {
   logRestartEvent,
 } from './monitoring';
 import { publicRoutes, api, adminUi, debug, cdp, relayRoutes } from './routes';
+import { redactSensitiveParams } from './utils/logging';
 import loadingPageHtml from './assets/loading.html';
 import configErrorHtml from './assets/config-error.html';
 
@@ -66,11 +67,11 @@ function transformErrorMessage(message: string, host: string): string {
   if (message.includes('gateway token missing') || message.includes('gateway token mismatch')) {
     return `Invalid or missing token. Visit https://${host}?token={REPLACE_WITH_YOUR_TOKEN}`;
   }
-  
+
   if (message.includes('pairing required')) {
     return `Pairing required. Visit https://${host}/_admin/`;
   }
-  
+
   return message;
 }
 
@@ -80,13 +81,14 @@ function transformErrorMessage(message: string, host: string): string {
  */
 function validateRequiredEnv(env: MoltbotEnv): string[] {
   const missing: string[] = [];
+  const isTestMode = env.DEV_MODE === 'true' || env.E2E_TEST_MODE === 'true';
 
   if (!getGatewayMasterToken(env)) {
     missing.push('MOLTBOT_GATEWAY_MASTER_TOKEN (or legacy MOLTBOT_GATEWAY_TOKEN)');
   }
 
-  // Require Supabase JWT secret for authentication
-  if (!env.SUPABASE_JWT_SECRET) {
+  // Require Supabase JWT secret for authentication (skip in dev/test mode)
+  if (!isTestMode && !env.SUPABASE_JWT_SECRET) {
     missing.push('SUPABASE_JWT_SECRET');
   }
 
@@ -117,12 +119,12 @@ function validateRequiredEnv(env: MoltbotEnv): string[] {
  */
 function buildSandboxOptions(env: MoltbotEnv): SandboxOptions {
   const sleepAfter = env.SANDBOX_SLEEP_AFTER?.toLowerCase() || 'never';
-  
+
   // 'never' means keep the container alive indefinitely
   if (sleepAfter === 'never') {
     return { keepAlive: true };
   }
-  
+
   // Otherwise, use the specified duration
   return { sleepAfter };
 }
@@ -137,7 +139,8 @@ const app = new Hono<AppEnv>();
 // Middleware: Log every request
 app.use('*', async (c, next) => {
   const url = new URL(c.req.url);
-  console.log(`[REQ] ${c.req.method} ${url.pathname}${url.search}`);
+  const redactedSearch = redactSensitiveParams(url);
+  console.log(`[REQ] ${c.req.method} ${url.pathname}${redactedSearch}`);
   console.log(`[REQ] Has ANTHROPIC_API_KEY: ${!!c.env.ANTHROPIC_API_KEY}`);
   console.log(`[REQ] DEV_MODE: ${c.env.DEV_MODE}`);
   console.log(`[REQ] DEBUG_ROUTES: ${c.env.DEBUG_ROUTES}`);
@@ -332,28 +335,28 @@ app.route('/api/super', adminRouter);
 // Middleware: Validate required environment variables (skip in dev mode and for debug routes)
 app.use('*', async (c, next) => {
   const url = new URL(c.req.url);
-  
+
   // Skip validation for debug routes (they have their own enable check)
   if (url.pathname.startsWith('/debug')) {
     return next();
   }
-  
+
   // Skip validation in dev mode
   if (c.env.DEV_MODE === 'true') {
     return next();
   }
-  
+
   const missingVars = validateRequiredEnv(c.env);
   if (missingVars.length > 0) {
     console.error('[CONFIG] Missing required environment variables:', missingVars.join(', '));
-    
+
     const acceptsHtml = c.req.header('Accept')?.includes('text/html');
     if (acceptsHtml) {
       // Return a user-friendly HTML error page
       const html = configErrorHtml.replace('{{MISSING_VARS}}', missingVars.join(', '));
       return c.html(html, 503);
     }
-    
+
     // Return JSON error for API requests
     return c.json({
       error: 'Configuration error',
@@ -362,7 +365,7 @@ app.use('*', async (c, next) => {
       hint: 'Set these using: wrangler secret put <VARIABLE_NAME>',
     }, 503);
   }
-  
+
   return next();
 });
 
@@ -526,9 +529,13 @@ app.all('*', async (c) => {
 
   // Proxy to Moltbot with WebSocket message interception
   if (isWebSocketRequest) {
+    const debugLogs = c.env.DEBUG_ROUTES === 'true';
+    const redactedSearch = redactSensitiveParams(url);
+
     console.log('[WS] Proxying WebSocket connection to Moltbot');
-    console.log('[WS] URL:', request.url);
-    console.log('[WS] Search params:', url.search);
+    if (debugLogs) {
+      console.log('[WS] URL:', url.pathname + redactedSearch);
+    }
 
     // Inject gateway token for container auth
     // Use per-user derived token if user is authenticated
@@ -545,7 +552,9 @@ app.all('*', async (c) => {
     // Add token to URL and as header (container might not see URL params)
     if (gatewayToken) {
       wsUrl.searchParams.set('token', gatewayToken);
-      console.log('[WS] Set gateway token in WebSocket URL');
+      if (debugLogs) {
+        console.log('[WS] Set gateway token in WebSocket URL');
+      }
     }
 
     // Create request with token in header as well
@@ -558,34 +567,40 @@ app.all('*', async (c) => {
       method: request.method,
       headers: wsHeaders,
     });
-    
+
     // Get WebSocket connection to the container
     const containerResponse = await sandbox.wsConnect(wsRequest, MOLTBOT_PORT);
     console.log('[WS] wsConnect response status:', containerResponse.status);
-    
+
     // Get the container-side WebSocket
     const containerWs = containerResponse.webSocket;
     if (!containerWs) {
       console.error('[WS] No WebSocket in container response - falling back to direct proxy');
       return containerResponse;
     }
-    
-    console.log('[WS] Got container WebSocket, setting up interception');
-    
+
+    if (debugLogs) {
+      console.log('[WS] Got container WebSocket, setting up interception');
+    }
+
     // Create a WebSocket pair for the client
     const [clientWs, serverWs] = Object.values(new WebSocketPair());
-    
+
     // Accept both WebSockets
     serverWs.accept();
     containerWs.accept();
-    
-    console.log('[WS] Both WebSockets accepted');
-    console.log('[WS] containerWs.readyState:', containerWs.readyState);
-    console.log('[WS] serverWs.readyState:', serverWs.readyState);
-    
+
+    if (debugLogs) {
+      console.log('[WS] Both WebSockets accepted');
+      console.log('[WS] containerWs.readyState:', containerWs.readyState);
+      console.log('[WS] serverWs.readyState:', serverWs.readyState);
+    }
+
     // Relay messages from client to container, injecting token into connect credentials
     serverWs.addEventListener('message', (event) => {
-      console.log('[WS] Client -> Container:', typeof event.data, typeof event.data === 'string' ? event.data.slice(0, 200) : '(binary)');
+      if (debugLogs) {
+        console.log('[WS] Client -> Container:', typeof event.data, typeof event.data === 'string' ? event.data.slice(0, 200) : '(binary)');
+      }
       let data = event.data;
 
       // Inject gateway token into connect message auth field
@@ -596,24 +611,23 @@ app.all('*', async (c) => {
         try {
           const parsed = JSON.parse(data);
           if (parsed.method === 'connect' && parsed.params) {
-            console.log('[WS] Injecting gateway token into connect auth');
-            // Initialize auth object if it doesn't exist, preserving other properties
+            if (debugLogs) {
+              console.log('[WS] Injecting gateway token into connect auth');
+            }
             parsed.params.auth = parsed.params.auth || {};
             parsed.params.auth.token = gatewayToken;
-            // Remove device object - token auth doesn't need device signature validation
-            // This prevents "device signature invalid" errors
             delete parsed.params.device;
-            // Remove any credentials field that might conflict with schema
             delete parsed.params.credentials;
-            // Change client ID from "clawdbot-control-ui" to "webchat" to bypass the HTTPS requirement
-            // The gateway has special handling for control-ui that requires secure context,
-            // but webchat with token auth works fine over HTTP behind a proxy
             if (parsed.params.client?.id === 'clawdbot-control-ui' || parsed.params.client?.id === 'control-ui') {
-              console.log('[WS] Changing client ID from', parsed.params.client.id, 'to webchat for proxy compatibility');
+              if (debugLogs) {
+                console.log('[WS] Changing client ID from', parsed.params.client.id, 'to webchat for proxy compatibility');
+              }
               parsed.params.client.id = 'webchat';
             }
             data = JSON.stringify(parsed);
-            console.log('[WS] Modified connect params (device removed):', JSON.stringify(parsed.params).slice(0, 300));
+            if (debugLogs) {
+              console.log('[WS] Modified connect params (device removed):', JSON.stringify(parsed.params).slice(0, 300));
+            }
           }
         } catch (e) {
           // Not JSON, pass through as-is
@@ -622,68 +636,86 @@ app.all('*', async (c) => {
 
       if (containerWs.readyState === WebSocket.OPEN) {
         containerWs.send(data);
-      } else {
+      } else if (debugLogs) {
         console.log('[WS] Container not open, readyState:', containerWs.readyState);
       }
     });
-    
+
     // Relay messages from container to client, with error transformation
     containerWs.addEventListener('message', (event) => {
-      console.log('[WS] Container -> Client (raw):', typeof event.data, typeof event.data === 'string' ? event.data.slice(0, 500) : '(binary)');
+      if (debugLogs) {
+        console.log('[WS] Container -> Client (raw):', typeof event.data, typeof event.data === 'string' ? event.data.slice(0, 500) : '(binary)');
+      }
       let data = event.data;
-      
+
       // Try to intercept and transform error messages
       if (typeof data === 'string') {
         try {
           const parsed = JSON.parse(data);
-          console.log('[WS] Parsed JSON, has error.message:', !!parsed.error?.message);
+          if (debugLogs) {
+            console.log('[WS] Parsed JSON, has error.message:', !!parsed.error?.message);
+          }
           if (parsed.error?.message) {
-            console.log('[WS] Original error.message:', parsed.error.message);
+            if (debugLogs) {
+              console.log('[WS] Original error.message:', parsed.error.message);
+            }
             parsed.error.message = transformErrorMessage(parsed.error.message, url.host);
-            console.log('[WS] Transformed error.message:', parsed.error.message);
+            if (debugLogs) {
+              console.log('[WS] Transformed error.message:', parsed.error.message);
+            }
             data = JSON.stringify(parsed);
           }
         } catch (e) {
-          console.log('[WS] Not JSON or parse error:', e);
+          if (debugLogs) {
+            console.log('[WS] Not JSON or parse error:', e);
+          }
         }
       }
-      
+
       if (serverWs.readyState === WebSocket.OPEN) {
         serverWs.send(data);
-      } else {
+      } else if (debugLogs) {
         console.log('[WS] Server not open, readyState:', serverWs.readyState);
       }
     });
-    
+
     // Handle close events
     serverWs.addEventListener('close', (event) => {
-      console.log('[WS] Client closed:', event.code, event.reason);
+      if (debugLogs) {
+        console.log('[WS] Client closed:', event.code, event.reason);
+      }
       containerWs.close(event.code, event.reason);
     });
-    
+
     containerWs.addEventListener('close', (event) => {
-      console.log('[WS] Container closed:', event.code, event.reason);
+      if (debugLogs) {
+        console.log('[WS] Container closed:', event.code, event.reason);
+      }
       // Transform the close reason (truncate to 123 bytes max for WebSocket spec)
       let reason = transformErrorMessage(event.reason, url.host);
       if (reason.length > 123) {
         reason = reason.slice(0, 120) + '...';
       }
-      console.log('[WS] Transformed close reason:', reason);
+      if (debugLogs) {
+        console.log('[WS] Transformed close reason:', reason);
+      }
       serverWs.close(event.code, reason);
     });
-    
+
     // Handle errors
     serverWs.addEventListener('error', (event) => {
       console.error('[WS] Client error:', event);
       containerWs.close(1011, 'Client error');
     });
-    
+
     containerWs.addEventListener('error', (event) => {
       console.error('[WS] Container error:', event);
       serverWs.close(1011, 'Container error');
     });
-    
-    console.log('[WS] Returning intercepted WebSocket response');
+
+    if (debugLogs) {
+      console.log('[WS] Returning intercepted WebSocket response');
+    }
     return new Response(null, {
       status: 101,
       webSocket: clientWs,
@@ -882,7 +914,7 @@ async function scheduled(
             const configText = await configObj.text();
             const config = JSON.parse(configText);
             const hasTelegram = config?.channels?.telegram?.botToken;
-            
+
             if (hasTelegram) {
               console.log(`[cron] Auto-starting gateway for ${sandboxName} - has Telegram configured but no processes`);
               try {
@@ -953,11 +985,11 @@ async function scheduled(
           try {
             // Use restartContainer which includes pre-shutdown sync (when enabled)
             const restartResult = await restartContainer(sandbox, env, userId);
-            
+
             if (restartResult.success) {
               recordRestart(userId);
               restartCount++;
-              logRestartEvent(userId, true, 'auto_health_failure', { 
+              logRestartEvent(userId, true, 'auto_health_failure', {
                 previousFailures: healthResult.consecutiveFailures,
               });
               console.log(`[cron] Auto-restart initiated for ${sandboxName}${restartResult.syncResult?.success ? ' with pre-shutdown sync' : ''}`);
@@ -987,7 +1019,7 @@ async function scheduled(
       // Run sync (only if sandbox is active and healthy or just restarted)
       // If CRITICAL_FILE_PRIORITY is enabled, sync critical files first
       let criticalSyncResult: { success: boolean; durationMs?: number } | undefined;
-      
+
       if (isBackupFeatureEnabled('CRITICAL_FILE_PRIORITY')) {
         criticalSyncResult = await syncCriticalFilesToR2(sandbox, env, { r2Prefix });
         if (criticalSyncResult.success) {
@@ -996,7 +1028,7 @@ async function scheduled(
           console.warn(`[cron] Critical file sync failed for ${sandboxName}:`, criticalSyncResult);
         }
       }
-      
+
       // Run full sync
       const syncResult = await syncToR2(sandbox, env, { r2Prefix });
 
@@ -1016,7 +1048,6 @@ async function scheduled(
         syncFailCount++;
 
         // Record sync failure to D1 if consecutive failures reach threshold
-        // Uses in-memory tracking across cron runs (not within single run)
         const consecutiveFailures = getConsecutiveSyncFailures(r2Prefix);
         if (consecutiveFailures >= 3 && env.PLATFORM_DB) {
           console.warn(`[cron] Recording sync failure to D1: ${consecutiveFailures} consecutive failures for ${userId}`);

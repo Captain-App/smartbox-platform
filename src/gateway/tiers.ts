@@ -9,7 +9,7 @@ import type { MoltbotEnv } from '../types';
 // Feature flag - controlled via env.TIERED_ROUTING_ENABLED
 // When false (default), all users use legacy 'Sandbox' binding
 // When true, migrated users use tiered bindings based on USER_TIER_MAP
-const TIERED_ROUTING_ENABLED = true; // Tiered routing enabled - 2026-02-04
+const TIERED_ROUTING_ENABLED = false; // Tiered routing disabled - debugging
 
 /**
  * User ID to instance tier mapping

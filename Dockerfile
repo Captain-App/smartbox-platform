@@ -20,8 +20,9 @@ RUN ARCH="$(dpkg --print-architecture)" \
 # Install pnpm globally
 RUN npm install -g pnpm
 
-# Install openclaw from Captain-App fork (v2026.2.3, includes Kimi K2.5 support)
-RUN npm install -g openclaw@https://github.com/Captain-App/openclaw.git \
+# Install openclaw from npm (latest stable)
+# Note: For Captain-App fork, build and publish to npm or use pre-built tarball
+RUN npm install -g openclaw@latest \
     && openclaw --version
 
 # Create openclaw directories

@@ -20,18 +20,11 @@ RUN ARCH="$(dpkg --print-architecture)" \
 # Install pnpm globally
 RUN npm install -g pnpm
 
-# Install git and build tools
-RUN apt-get update && apt-get install -y git python3 make g++
-
-# Clone and build openclaw from Captain-App fork (includes CaptainApp provider)
-RUN git clone https://github.com/Captain-App/openclaw.git /tmp/openclaw-build \
-    && cd /tmp/openclaw-build \
-    && npm install --legacy-peer-deps --force || npm install --ignore-scripts \
-    && npm run build \
-    && npm pack \
-    && npm install -g captain-app-openclaw-*.tgz \
+# Copy pre-built openclaw tarball from local build
+COPY openclaw-2026.2.4.tgz /tmp/
+RUN npm install -g /tmp/openclaw-2026.2.4.tgz \
     && openclaw --version \
-    && rm -rf /tmp/openclaw-build
+    && rm /tmp/openclaw-2026.2.4.tgz
 
 # Create openclaw directories
 # Templates are stored in /root/.openclaw-templates for initialization
@@ -42,7 +35,7 @@ RUN mkdir -p /root/.openclaw \
 
 # Copy startup script
 # Build cache bust: 2026-02-04-v12-captainapp-provider
-ARG BUILD_VERSION=v17
+ARG BUILD_VERSION=v18
 COPY start-moltbot.sh /usr/local/bin/start-moltbot.sh
 RUN chmod +x /usr/local/bin/start-moltbot.sh
 
@@ -59,4 +52,4 @@ WORKDIR /root/openclaw
 
 # Expose the gateway port
 EXPOSE 18789
-# Build cache bust: Wed Feb  5 08:50:00 GMT 2026
+# Build cache bust: Wed Feb  5 08:55:00 GMT 2026

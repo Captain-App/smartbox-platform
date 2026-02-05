@@ -20,12 +20,18 @@ RUN ARCH="$(dpkg --print-architecture)" \
 # Install pnpm globally
 RUN npm install -g pnpm
 
-# Install openclaw from npm (latest stable)
-RUN npm install -g openclaw@latest \
-    && openclaw --version
+# Install git and build tools
+RUN apt-get update && apt-get install -y git python3 make g++
 
-# Copy CaptainApp provider patch
-COPY captainapp-provider.patch.js /usr/local/lib/node_modules/openclaw-captainapp-patch.js
+# Clone and build openclaw from Captain-App fork (includes CaptainApp provider)
+RUN git clone https://github.com/Captain-App/openclaw.git /tmp/openclaw-build \
+    && cd /tmp/openclaw-build \
+    && npm install \
+    && npm run build \
+    && npm pack \
+    && npm install -g captain-app-openclaw-*.tgz \
+    && openclaw --version \
+    && rm -rf /tmp/openclaw-build
 
 # Create openclaw directories
 # Templates are stored in /root/.openclaw-templates for initialization
@@ -36,12 +42,14 @@ RUN mkdir -p /root/.openclaw \
 
 # Copy startup script
 # Build cache bust: 2026-02-04-v12-captainapp-provider
-ARG BUILD_VERSION=v12
+ARG BUILD_VERSION=v16
 COPY start-moltbot.sh /usr/local/bin/start-moltbot.sh
 RUN chmod +x /usr/local/bin/start-moltbot.sh
 
 # Copy default configuration template
+# Cache bust: 2026-02-05-v14 - Force template update with Telegram config
 COPY moltbot.json.template /root/.openclaw-templates/moltbot.json.template
+RUN cat /root/.openclaw-templates/moltbot.json.template | head -5
 
 # Copy custom skills
 COPY skills/ /root/openclaw/skills/
@@ -51,4 +59,4 @@ WORKDIR /root/openclaw
 
 # Expose the gateway port
 EXPOSE 18789
-# Build cache bust: Wed Feb  4 22:24:32 GMT 2026
+# Build cache bust: Wed Feb  5 08:50:00 GMT 2026

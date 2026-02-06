@@ -128,8 +128,7 @@ describe('mountR2Storage', () => {
       await mountR2Storage(sandbox, env);
 
       expect(console.log).toHaveBeenCalledWith(
-        'R2 bucket mounted successfully at',
-        '/data/openclaw'
+        expect.stringContaining('[R2] Bucket mounted successfully at')
       );
     });
   });
@@ -148,7 +147,7 @@ describe('mountR2Storage', () => {
 
       expect(result).toBe(false);
       expect(console.error).toHaveBeenCalledWith(
-        'Failed to mount R2 bucket:',
+        '[R2] Failed to mount bucket:',
         expect.any(Error)
       );
     });
@@ -166,7 +165,7 @@ describe('mountR2Storage', () => {
       const result = await mountR2Storage(sandbox, env);
 
       expect(result).toBe(true);
-      expect(console.log).toHaveBeenCalledWith('R2 bucket is mounted despite error');
+      expect(console.log).toHaveBeenCalledWith('[R2] Bucket is mounted despite error');
     });
   });
 });

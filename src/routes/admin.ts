@@ -182,8 +182,282 @@ async function getAllUserIds(env: AppEnv): Promise<string[]> {
     '5bb7d208-2baf-4c95-8aec-f28e016acedb', // david lippold
     'e29fd082-6811-4e29-893e-64699c49e1f0', // ben lippold
     'fe56406b-a723-43cf-9f19-ba2ffcb135b0', // miles
+    '81bf6a68-28fe-48ef-b257-f9ad013e6298', // josh
   ];
 }
+
+// =============================================================================
+// Lightweight R2-Only Endpoints (Bypass DO - work even when DO is stuck)
+// =============================================================================
+
+/**
+ * GET /api/super/users/:id/r2-status
+ * Check user's R2 backup status (NO DO interaction)
+ * Fast (<1s) even if DO is stuck
+ */
+adminRouter.get('/users/:id/r2-status', requireSuperAuth, async (c) => {
+  const userId = c.req.param('id');
+  console.log(`[R2-STATUS] Starting for user ${userId.slice(0, 8)}...`);
+
+  try {
+    const prefix = `users/${userId}/`;
+    console.log(`[R2-STATUS] Listing R2 objects with prefix: ${prefix}`);
+    const listed = await c.env.MOLTBOT_BUCKET.list({ prefix, limit: 100 });
+    console.log(`[R2-STATUS] Got ${listed.objects.length} objects`);
+
+    // Get sync markers
+    const lastSync = await c.env.MOLTBOT_BUCKET.get(`${prefix}.last-sync`);
+    const lastSyncCritical = await c.env.MOLTBOT_BUCKET.get(`${prefix}.last-sync-critical`);
+    const lastSyncShutdown = await c.env.MOLTBOT_BUCKET.get(`${prefix}.last-sync-shutdown`);
+
+    // Get config
+    const configObj = await c.env.MOLTBOT_BUCKET.get(`${prefix}openclaw/openclaw.json`);
+    let config: any = null;
+    if (configObj) {
+      try { config = JSON.parse(await configObj.text()); } catch { /* ignore */ }
+    }
+
+    // Get secrets keys (not values)
+    const secretsObj = await c.env.MOLTBOT_BUCKET.get(`${prefix}secrets.json`);
+    let secretKeys: string[] | null = null;
+    if (secretsObj) {
+      try {
+        const secrets = JSON.parse(await secretsObj.text());
+        secretKeys = Object.keys(secrets).filter(k => !!secrets[k]);
+      } catch { /* ignore */ }
+    }
+
+    // Parse last sync time (format may be "label|timestamp" or just "timestamp")
+    const lastSyncText = lastSync ? await lastSync.text() : null;
+    let syncTime: Date | null = null;
+    let minutesSinceSync: number | null = null;
+    if (lastSyncText) {
+      try {
+        const timestampPart = lastSyncText.includes('|') ? lastSyncText.split('|')[1] : lastSyncText;
+        const parsed = new Date(timestampPart.trim());
+        if (!isNaN(parsed.getTime())) {
+          syncTime = parsed;
+          minutesSinceSync = Math.round((Date.now() - syncTime.getTime()) / 60000);
+        }
+      } catch { /* ignore invalid dates */ }
+    }
+
+    return c.json({
+      userId,
+      hasBackup: listed.objects.length > 0,
+      fileCount: listed.objects.length,
+      files: listed.objects.slice(0, 20).map(o => ({
+        key: o.key.replace(prefix, ''),
+        size: o.size,
+        uploaded: o.uploaded?.toISOString(),
+      })),
+      lastSync: syncTime?.toISOString() || null,
+      minutesSinceSync,
+      lastSyncCritical: lastSyncCritical ? await lastSyncCritical.text() : null,
+      lastSyncShutdown: lastSyncShutdown ? await lastSyncShutdown.text() : null,
+      config: config ? {
+        name: config.name,
+        model: config.model || config.agents?.defaults?.model?.primary,
+        personality: config.personality?.slice(0, 100),
+        gateway: config.gateway,
+      } : null,
+      secrets: secretKeys,
+      healthy: minutesSinceSync !== null && minutesSinceSync < 5,
+    });
+  } catch (error) {
+    return c.json({
+      error: error instanceof Error ? error.message : 'Unknown error',
+      userId,
+    }, 500);
+  }
+});
+
+/**
+ * GET /api/super/users/:id/r2-health
+ * Quick health check via R2 markers (NO DO interaction)
+ */
+adminRouter.get('/users/:id/r2-health', requireSuperAuth, async (c) => {
+  const userId = c.req.param('id');
+
+  try {
+    const lastSync = await c.env.MOLTBOT_BUCKET.get(`users/${userId}/.last-sync`);
+
+    if (!lastSync) {
+      return c.json({
+        healthy: false,
+        reason: 'No sync data found in R2',
+        userId,
+      });
+    }
+
+    const syncContent = await lastSync.text();
+    const timestamp = syncContent.split('|')[1] || syncContent;
+    const syncTime = new Date(timestamp);
+    const minutesSinceSync = (Date.now() - syncTime.getTime()) / 60000;
+
+    return c.json({
+      healthy: minutesSinceSync < 5,
+      lastSync: syncTime.toISOString(),
+      minutesSinceSync: Math.round(minutesSinceSync),
+      threshold: 5,
+      userId,
+    });
+  } catch (error) {
+    return c.json({
+      healthy: false,
+      error: error instanceof Error ? error.message : 'Unknown',
+      userId,
+    }, 500);
+  }
+});
+
+/**
+ * POST /api/super/users/:id/restart-async
+ * Restart user's container (returns immediately, restart happens in background)
+ */
+adminRouter.post('/users/:id/restart-async', requireSuperAuth, async (c) => {
+  const userId = c.req.param('id');
+
+  try {
+    const sandbox = await getUserSandbox(c.env, userId, true);
+
+    // Fire restart in background - don't wait
+    const restartPromise = (async () => {
+      try {
+        console.log(`[ASYNC-RESTART] Starting restart for ${userId.slice(0, 8)}...`);
+
+        // Batch kill all processes in one API call (not one-by-one)
+        try {
+          const killed = await sandbox.killAllProcesses();
+          console.log(`[ASYNC-RESTART] Killed ${killed} processes via killAllProcesses()`);
+        } catch (e) {
+          console.warn(`[ASYNC-RESTART] killAllProcesses() failed, trying shell kill:`, e);
+          // Fallback: shell-based kill
+          try {
+            await sandbox.exec('kill -9 -1 2>/dev/null; true', { timeout: 5000 });
+          } catch { /* ignore - process may kill itself */ }
+        }
+
+        await new Promise(r => setTimeout(r, 2000));
+
+        // Clear locks
+        try {
+          await sandbox.exec('rm -f /tmp/openclaw*.lock /root/.openclaw/*.lock 2>/dev/null', { timeout: 5000 });
+        } catch { /* ignore */ }
+
+        // Start gateway
+        const { ensureMoltbotGateway } = await import('../gateway');
+        await ensureMoltbotGateway(sandbox, c.env, userId);
+
+        console.log(`[ASYNC-RESTART] ✅ Gateway started for ${userId.slice(0, 8)}`);
+      } catch (err) {
+        console.error(`[ASYNC-RESTART] ❌ Failed for ${userId.slice(0, 8)}:`, err);
+      }
+    })();
+
+    c.executionCtx.waitUntil(restartPromise);
+
+    return c.json({
+      success: true,
+      userId,
+      message: 'Restart initiated in background',
+      checkStatusUrl: `/api/super/users/${userId}/r2-status`,
+      note: 'Check status in 30-60 seconds',
+    });
+  } catch (error) {
+    return c.json({
+      error: error instanceof Error ? error.message : 'Unknown error',
+      userId,
+    }, 500);
+  }
+});
+
+/**
+ * POST /api/super/users/:id/sync-async
+ * Trigger a sync in the background (returns immediately)
+ */
+adminRouter.post('/users/:id/sync-async', requireSuperAuth, async (c) => {
+  const userId = c.req.param('id');
+
+  try {
+    const sandbox = await getUserSandbox(c.env, userId, true);
+
+    // Fire sync in background
+    const syncPromise = (async () => {
+      try {
+        const { syncToR2 } = await import('../gateway');
+        const result = await syncToR2(sandbox, c.env, { r2Prefix: `users/${userId}` });
+        console.log(`[ASYNC-SYNC] ${userId.slice(0, 8)}: ${result.success ? 'success' : result.error}`);
+      } catch (err) {
+        console.error(`[ASYNC-SYNC] ${userId.slice(0, 8)} failed:`, err);
+      }
+    })();
+
+    c.executionCtx.waitUntil(syncPromise);
+
+    return c.json({
+      success: true,
+      userId,
+      message: 'Sync initiated in background',
+      checkStatusAt: `/api/super/users/${userId}/r2-status`,
+    });
+  } catch (error) {
+    return c.json({
+      error: error instanceof Error ? error.message : 'Unknown error',
+      userId,
+    }, 500);
+  }
+});
+
+/**
+ * POST /api/super/users/:id/emergency-reset
+ * Emergency reset: deletes all local state, forces restore from R2
+ */
+adminRouter.post('/users/:id/emergency-reset', requireSuperAuth, async (c) => {
+  const userId = c.req.param('id');
+
+  try {
+    const sandbox = await getUserSandbox(c.env, userId, true);
+
+    console.log(`[EMERGENCY-RESET] Starting for ${userId.slice(0, 8)}...`);
+
+    // Batch kill all processes in one API call
+    try {
+      const killed = await sandbox.killAllProcesses();
+      console.log(`[EMERGENCY-RESET] Killed ${killed} processes via killAllProcesses()`);
+    } catch (e) {
+      console.warn(`[EMERGENCY-RESET] killAllProcesses() failed, trying shell kill:`, e);
+      try {
+        await sandbox.exec('kill -9 -1 2>/dev/null; true', { timeout: 5000 });
+      } catch { /* ignore */ }
+    }
+    await new Promise(r => setTimeout(r, 2000));
+
+    // Clear all locks and local state
+    try {
+      await sandbox.exec('rm -rf /tmp/openclaw*.lock /root/.openclaw/*.lock /root/.openclaw/.last-sync 2>/dev/null', { timeout: 5000 });
+    } catch { /* ignore */ }
+
+    // Start fresh gateway (will restore from R2)
+    const { ensureMoltbotGateway } = await import('../gateway');
+    const bootPromise = ensureMoltbotGateway(sandbox, c.env, userId).catch(err => {
+      console.error(`[EMERGENCY-RESET] Gateway start failed for ${userId.slice(0, 8)}:`, err);
+    });
+    c.executionCtx.waitUntil(bootPromise);
+
+    return c.json({
+      success: true,
+      userId,
+      message: 'Emergency reset initiated - restoring from R2',
+      checkStatusUrl: `/api/super/users/${userId}/r2-status`,
+    });
+  } catch (error) {
+    return c.json({
+      error: error instanceof Error ? error.message : 'Unknown error',
+      userId,
+    }, 500);
+  }
+});
 
 // =============================================================================
 // Phase 2: State-Aware API
@@ -192,7 +466,6 @@ async function getAllUserIds(env: AppEnv): Promise<string[]> {
 // GET /api/super/users/:id/state - Get container state
 adminRouter.get('/users/:id/state', requireSuperAuth, async (c) => {
   const userId = c.req.param('id');
-  
   try {
     const sandbox = await getUserSandbox(c.env, userId, false);
     const status: ContainerStatus = {
@@ -422,18 +695,11 @@ adminRouter.post('/users/:id/wake', requireSuperAuth, async (c) => {
     // Start the container
     console.log(`[WAKE] Waking up container for user ${userId}...`);
     
-    // Kill any stale processes first
+    // Kill any stale processes first (batch)
     try {
-      const processes = await sandbox.listProcesses();
-      for (const proc of processes) {
-        try {
-          await proc.kill();
-        } catch {
-          // Ignore kill errors
-        }
-      }
+      await sandbox.killAllProcesses();
     } catch {
-      // Ignore if can't list processes
+      // Ignore if can't kill processes
     }
 
     // Wait a moment for cleanup
@@ -519,13 +785,10 @@ async function withWake(env: any, userId: string, operation: () => Promise<Respo
   if (needsWake) {
     const { ensureMoltbotGateway } = await import('../gateway');
     console.log(`[AUTO-WAKE] Waking container for ${userId} before operation`);
-    
-    // Kill stale processes
+
+    // Kill stale processes (batch)
     try {
-      const processes = await sandbox.listProcesses();
-      for (const proc of processes) {
-        try { await proc.kill(); } catch {}
-      }
+      await sandbox.killAllProcesses();
     } catch {}
     
     await new Promise(r => setTimeout(r, 1000));
@@ -1378,6 +1641,259 @@ adminRouter.get('/cost/rates', requireSuperAuth, async (c) => {
     },
     effectiveDate: '2025-01-01',
     source: 'Cloudflare published pricing',
+  });
+});
+
+// =============================================================================
+// Deep Merge Helper
+// =============================================================================
+
+/**
+ * Deep merge two objects. Arrays are replaced, not concatenated.
+ * Source values override target values at each level.
+ */
+function deepMerge(target: any, source: any): any {
+  const result = { ...target };
+  for (const key of Object.keys(source)) {
+    const sourceVal = source[key];
+    const targetVal = result[key];
+    if (
+      sourceVal !== null &&
+      typeof sourceVal === 'object' &&
+      !Array.isArray(sourceVal) &&
+      targetVal !== null &&
+      typeof targetVal === 'object' &&
+      !Array.isArray(targetVal)
+    ) {
+      result[key] = deepMerge(targetVal, sourceVal);
+    } else {
+      result[key] = sourceVal;
+    }
+  }
+  return result;
+}
+
+// =============================================================================
+// PATCH Config (Deep Merge)
+// =============================================================================
+
+/**
+ * PATCH /api/super/users/:id/config - Deep merge patch into existing config
+ * Reads existing config from R2, deep merges the patch, writes back.
+ * Preserves existing channels/settings not mentioned in the patch.
+ */
+adminRouter.patch('/users/:id/config', requireSuperAuth, async (c) => {
+  const userId = c.req.param('id');
+
+  let patch: any;
+  try {
+    patch = await c.req.json();
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+
+  try {
+    const configKey = `users/${userId}/openclaw/openclaw.json`;
+
+    // GET existing config
+    const existing = await c.env.MOLTBOT_BUCKET.get(configKey);
+    let currentConfig: any = {};
+    if (existing) {
+      try {
+        currentConfig = JSON.parse(await existing.text());
+      } catch {
+        return c.json({ error: 'Existing config is not valid JSON' }, 500);
+      }
+    }
+
+    // Deep merge
+    const merged = deepMerge(currentConfig, patch);
+    const configText = JSON.stringify(merged, null, 2);
+
+    // Save history
+    try {
+      const historyKey = `users/${userId}/openclaw/openclaw.json.history`;
+      const existingHistory = await c.env.MOLTBOT_BUCKET.get(historyKey);
+      let history: any[] = [];
+      if (existingHistory) {
+        try { history = JSON.parse(await existingHistory.text()); } catch {}
+      }
+      history.push({ timestamp: new Date().toISOString(), config: currentConfig });
+      if (history.length > 10) history = history.slice(-10);
+      await c.env.MOLTBOT_BUCKET.put(historyKey, JSON.stringify(history, null, 2), {
+        httpMetadata: { contentType: 'application/json' },
+      });
+    } catch { /* ignore history errors */ }
+
+    // PUT merged config
+    await c.env.MOLTBOT_BUCKET.put(configKey, configText, {
+      httpMetadata: { contentType: 'application/json' },
+    });
+
+    // Update container
+    try {
+      const sandbox = await getUserSandbox(c.env, userId, true);
+      await sandbox.mkdir('/root/.openclaw', { recursive: true });
+      await sandbox.writeFile('/root/.openclaw/openclaw.json', configText);
+      const reloadProc = await sandbox.startProcess('killall -HUP openclaw 2>/dev/null || true');
+      await new Promise(r => setTimeout(r, 500));
+      await reloadProc.getLogs();
+    } catch {
+      // Container may not be running — R2 config will be picked up on next start
+    }
+
+    return c.json({
+      userId,
+      success: true,
+      message: 'Config patched (deep merge) in R2 and container',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    return c.json({
+      userId,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    }, 500);
+  }
+});
+
+// =============================================================================
+// Bulk Operations
+// =============================================================================
+
+/**
+ * POST /api/super/bulk/config-patch
+ * Apply a config patch (deep merge) to all or specified users.
+ * Body: { patch: {...}, userIds?: string[] }
+ */
+adminRouter.post('/bulk/config-patch', requireSuperAuth, async (c) => {
+  let body: any;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+
+  const { patch, userIds: requestedIds } = body;
+  if (!patch || typeof patch !== 'object') {
+    return c.json({ error: 'patch object is required' }, 400);
+  }
+
+  const allUserIds = await getAllUserIds(c.env);
+  const targetIds = requestedIds && Array.isArray(requestedIds) ? requestedIds : allUserIds;
+
+  const results: Array<{ userId: string; success: boolean; error?: string }> = [];
+
+  for (const userId of targetIds) {
+    try {
+      const configKey = `users/${userId}/openclaw/openclaw.json`;
+      const existing = await c.env.MOLTBOT_BUCKET.get(configKey);
+      let currentConfig: any = {};
+      if (existing) {
+        try { currentConfig = JSON.parse(await existing.text()); } catch {}
+      }
+
+      const merged = deepMerge(currentConfig, patch);
+      const configText = JSON.stringify(merged, null, 2);
+
+      await c.env.MOLTBOT_BUCKET.put(configKey, configText, {
+        httpMetadata: { contentType: 'application/json' },
+      });
+
+      // Try to update container (best effort)
+      try {
+        const sandbox = await getUserSandbox(c.env, userId, true);
+        await sandbox.mkdir('/root/.openclaw', { recursive: true });
+        await sandbox.writeFile('/root/.openclaw/openclaw.json', configText);
+      } catch { /* container may not be running */ }
+
+      results.push({ userId, success: true });
+    } catch (error) {
+      results.push({ userId, success: false, error: error instanceof Error ? error.message : 'Unknown error' });
+    }
+  }
+
+  return c.json({
+    success: results.every(r => r.success),
+    total: results.length,
+    succeeded: results.filter(r => r.success).length,
+    failed: results.filter(r => !r.success).length,
+    results,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+/**
+ * POST /api/super/bulk/restart
+ * Sequentially restart all or specified user containers.
+ * Body: { userIds?: string[], delayMs?: number }
+ * Default delay: 5000ms between restarts.
+ */
+adminRouter.post('/bulk/restart', requireSuperAuth, async (c) => {
+  let body: any;
+  try {
+    body = await c.req.json().catch(() => ({}));
+  } catch {
+    body = {};
+  }
+
+  const { userIds: requestedIds, delayMs = 5000 } = body;
+  const allUserIds = await getAllUserIds(c.env);
+  const targetIds = requestedIds && Array.isArray(requestedIds) ? requestedIds : allUserIds;
+
+  const results: Array<{ userId: string; success: boolean; error?: string }> = [];
+
+  // Run restarts sequentially in background so we can return immediately
+  const restartPromise = (async () => {
+    for (let i = 0; i < targetIds.length; i++) {
+      const userId = targetIds[i];
+      try {
+        console.log(`[BULK-RESTART] (${i + 1}/${targetIds.length}) Restarting ${userId.slice(0, 8)}...`);
+        const sandbox = await getUserSandbox(c.env, userId, true);
+
+        // Kill all processes
+        try {
+          await sandbox.killAllProcesses();
+        } catch {
+          try {
+            await sandbox.exec('kill -9 -1 2>/dev/null; true', { timeout: 5000 });
+          } catch { /* ignore */ }
+        }
+
+        await new Promise(r => setTimeout(r, 2000));
+
+        // Clear locks
+        try {
+          await sandbox.exec('rm -f /tmp/openclaw*.lock /root/.openclaw/*.lock 2>/dev/null', { timeout: 5000 });
+        } catch { /* ignore */ }
+
+        // Start gateway
+        const { ensureMoltbotGateway } = await import('../gateway');
+        await ensureMoltbotGateway(sandbox, c.env, userId);
+
+        console.log(`[BULK-RESTART] (${i + 1}/${targetIds.length}) ✅ ${userId.slice(0, 8)} restarted`);
+        results.push({ userId, success: true });
+      } catch (error) {
+        console.error(`[BULK-RESTART] (${i + 1}/${targetIds.length}) ❌ ${userId.slice(0, 8)}:`, error);
+        results.push({ userId, success: false, error: error instanceof Error ? error.message : 'Unknown error' });
+      }
+
+      // Delay between restarts (skip after last)
+      if (i < targetIds.length - 1) {
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+    }
+    console.log(`[BULK-RESTART] Complete: ${results.filter(r => r.success).length}/${results.length} succeeded`);
+  })();
+
+  c.executionCtx.waitUntil(restartPromise);
+
+  return c.json({
+    message: 'Bulk restart initiated in background',
+    total: targetIds.length,
+    delayMs,
+    estimatedDurationMs: targetIds.length * (delayMs + 5000),
+    checkStatusUrl: '/api/super/state/dashboard',
+    timestamp: new Date().toISOString(),
   });
 });
 

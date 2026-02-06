@@ -33,9 +33,12 @@ RUN mkdir -p /root/.openclaw \
     && mkdir -p /root/openclaw \
     && mkdir -p /root/openclaw/skills
 
+# Copy CaptainApp provider patch (adds captainapp/kimi-k2.5 model support)
+COPY captainapp-provider.patch.js /usr/local/lib/node_modules/openclaw-captainapp-patch.js
+
 # Copy startup script
-# Build cache bust: 2026-02-04-v12-captainapp-provider
-ARG BUILD_VERSION=v18
+# Build cache bust: 2026-02-05-captainapp-patch
+ARG BUILD_VERSION=v22
 COPY start-moltbot.sh /usr/local/bin/start-moltbot.sh
 RUN chmod +x /usr/local/bin/start-moltbot.sh
 
@@ -52,4 +55,4 @@ WORKDIR /root/openclaw
 
 # Expose the gateway port
 EXPOSE 18789
-# Build cache bust: Wed Feb  5 08:55:00 GMT 2026
+RUN echo "build-2026-02-06-v2-modelid-fix" > /tmp/.build-version

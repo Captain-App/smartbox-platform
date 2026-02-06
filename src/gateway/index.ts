@@ -12,9 +12,12 @@ export {
   resetHealthState,
   getHealthState,
   getAllHealthStates,
+  isCircuitBreakerTripped,
+  recordRestartForCircuitBreaker,
+  resetCircuitBreaker,
 } from './health';
 export type { HealthCheckResult, HealthCheckConfig } from './health';
-export { getSandboxForUser, getInstanceTypeName, setUserTier, getAllTierAssignments } from './tiers';
+export { getSandboxForUser, getInstanceTypeName, getTierForUser, setUserTier, getAllTierAssignments } from './tiers';
 
 // Zero-data-loss backup system (Week 1)
 export {

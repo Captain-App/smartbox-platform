@@ -319,16 +319,14 @@ describe('Super debug endpoints', () => {
     const app = createPublicTestApp();
 
     vi.mocked(getSandbox).mockReturnValueOnce(sandbox);
-    vi.mocked(gateway.syncToR2).mockResolvedValueOnce({ success: true } as any);
 
     listProcessesMock.mockResolvedValueOnce([
       { id: 'p1', command: 'openclaw gateway', kill: vi.fn(async () => undefined) },
     ] as any);
 
-    // Clear locks, doctor --fix
+    // Clear locks
     startProcessMock
-      .mockResolvedValueOnce(createMockProcess('locks cleared'))
-      .mockResolvedValueOnce(createMockProcess('doctor ok', { exitCode: 0 }));
+      .mockResolvedValueOnce(createMockProcess('locks cleared'));
 
     const env = createMockEnv({ SANDBOX_SLEEP_AFTER: 'never' });
 
@@ -338,10 +336,9 @@ describe('Super debug endpoints', () => {
     vi.useRealTimers();
 
     expect(res.status).toBe(200);
-    const body = await json<{ success: boolean; message: string; doctor: string }>(res);
+    const body = await json<{ success: boolean; message: string }>(res);
     expect(body.success).toBe(true);
     expect(body.message).toContain('Gateway restarting');
-    expect(body.doctor).toContain('doctor ok');
     expect(execCtx.waitUntil).toHaveBeenCalledTimes(1);
   });
 });

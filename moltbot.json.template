@@ -3,20 +3,17 @@
     "lastTouchedVersion": "2026.2.4",
     "lastTouchedAt": "2026-02-05T00:00:00Z"
   },
+  "providers": {
+    "captainapp": {
+      "baseUrl": "https://api.captainapp.co.uk/v1"
+    }
+  },
   "agents": {
     "defaults": {
       "model": {
         "primary": "captainapp/kimi-k2.5"
       },
-      "workspace": "/root/clawd"
-    }
-  },
-  "channels": {
-    "telegram": {
-      "botToken": "7526027664:AAFGuRZSXCoRfLdwUYf6xWF2dUqRE3NgEcE",
-      "dmPolicy": "pairing",
-      "groupPolicy": "allowlist",
-      "streamMode": "partial"
+      "workspace": "/root/openclaw"
     }
   },
   "gateway": {

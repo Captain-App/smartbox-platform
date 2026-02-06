@@ -1,10 +1,11 @@
 import type { Sandbox, Process } from '@cloudflare/sandbox';
 import type { MoltbotEnv } from '../types';
 import { MOLTBOT_PORT, STARTUP_TIMEOUT_MS } from '../config';
-import { buildEnvVars, deriveUserGatewayToken, getGatewayMasterToken } from './env';
+import { buildEnvVars, deriveCaptainAppKey, deriveUserGatewayToken, getGatewayMasterToken } from './env';
 import { mountR2Storage } from './r2';
 import { syncBeforeShutdown, syncToR2 } from './sync';
 import { isBackupFeatureEnabled } from '../config/backup';
+import { getTierForUser } from './tiers';
 
 /**
  * In-memory lock to prevent concurrent gateway starts for the same sandbox.
@@ -122,9 +123,32 @@ export async function ensureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv, us
  * Internal implementation of ensureMoltbotGateway
  */
 async function doEnsureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv, userId: string | undefined, sandboxName: string): Promise<Process> {
-  // Mount R2 storage for persistent data (non-blocking if not configured)
+  const startupStart = Date.now();
+
+  // Log tier/binding info
+  const tierInfo = userId ? `user ${userId.slice(0, 8)} (tier: ${getTierForUser(userId)})` : 'default';
+  console.log(`[STARTUP] Starting gateway for ${tierInfo}`);
+  console.log(`[STARTUP] Sandbox: ${sandboxName}`);
+
+  // Mount R2 storage (fire-and-forget - don't block startup)
   // R2 is used as a backup - the startup script will restore from it on boot
-  await mountR2Storage(sandbox, env);
+  console.log('[STARTUP] Phase 1: Initiating R2 mount (non-blocking)...');
+  const r2MountStart = Date.now();
+  const r2MountPromise = mountR2Storage(sandbox, env)
+    .then(success => {
+      const duration = Date.now() - r2MountStart;
+      if (success) {
+        console.log(`[STARTUP] R2 mount succeeded in ${duration}ms`);
+      } else {
+        console.warn(`[STARTUP] R2 mount failed after ${duration}ms - using degraded mode`);
+      }
+      return success;
+    })
+    .catch(err => {
+      console.error('[STARTUP] R2 mount error:', err);
+      return false;
+    });
+  // Don't await - gateway starts immediately while R2 mounts in background
 
   // Ensure user is registered in R2 for cron discovery
   // This writes a marker file so the cron can find new users
@@ -144,25 +168,28 @@ async function doEnsureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv, userId:
   }
 
   // Check if Moltbot is already running or starting
+  console.log('[STARTUP] Phase 2: Checking for existing gateway process...');
   const existingProcess = await findExistingMoltbotProcess(sandbox);
   if (existingProcess) {
-    console.log('Found existing Moltbot process:', existingProcess.id, 'status:', existingProcess.status);
+    console.log(`[STARTUP] Found existing process: ${existingProcess.id} (status: ${existingProcess.status})`);
 
     // Always use full startup timeout - a process can be "running" but not ready yet
     // (e.g., just started by another concurrent request). Using a shorter timeout
     // causes race conditions where we kill processes that are still initializing.
     try {
-      console.log('Waiting for Moltbot gateway on port', MOLTBOT_PORT, 'timeout:', STARTUP_TIMEOUT_MS);
+      console.log(`[STARTUP] Waiting for port ${MOLTBOT_PORT} (timeout: ${STARTUP_TIMEOUT_MS}ms)...`);
       await existingProcess.waitForPort(MOLTBOT_PORT, { mode: 'tcp', timeout: STARTUP_TIMEOUT_MS });
-      console.log('Moltbot gateway is reachable');
+      const totalDuration = Date.now() - startupStart;
+      console.log(`[STARTUP] ✅ Gateway ready (existing process) in ${totalDuration}ms`);
       return existingProcess;
     } catch (e) {
       // Timeout waiting for port - process is likely dead or stuck, kill and restart
-      console.log('Existing process not reachable after full timeout, killing and restarting...');
+      const waitDuration = Date.now() - startupStart;
+      console.log(`[STARTUP] Existing process not reachable after ${waitDuration}ms, killing and restarting...`);
       try {
         await existingProcess.kill();
       } catch (killError) {
-        console.log('Failed to kill process:', killError);
+        console.log('[STARTUP] Failed to kill process:', killError);
       }
     }
   }
@@ -175,6 +202,13 @@ async function doEnsureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv, userId:
     console.log(`[Gateway] Derived per-user token for user ${userId.slice(0, 8)}...`);
   }
 
+  // Derive per-user CaptainApp API key if master key is set
+  let captainAppKey: string | undefined;
+  if (userId && env.CAPTAINAPP_MASTER_KEY) {
+    captainAppKey = await deriveCaptainAppKey(env.CAPTAINAPP_MASTER_KEY, userId);
+    console.log(`[CaptainApp] Derived per-user API key for user ${userId.slice(0, 8)}...`);
+  }
+
   // Load user-specific secrets from R2
   let userSecrets: Record<string, string> = {};
   if (userId) {
@@ -182,16 +216,14 @@ async function doEnsureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv, userId:
   }
 
   // Start a new Moltbot gateway
-  console.log('Starting new Moltbot gateway...');
-  console.log(`[Gateway] userId param: ${userId || '(not set)'}`);
+  console.log('[STARTUP] Phase 3: Starting new gateway process...');
   const envVars = buildEnvVars(env, userGatewayToken, userId);
-  console.log(`[Gateway] OPENCLAW_USER_ID in envVars: ${envVars.OPENCLAW_USER_ID || '(not set)'}`);
-  console.log(`[Gateway] OPENCLAW_GATEWAY_TOKEN in envVars: ${envVars.OPENCLAW_GATEWAY_TOKEN ? '(set)' : '(not set)'}`);
-  console.log(`[Gateway] R2_ACCESS_KEY_ID in envVars: ${envVars.R2_ACCESS_KEY_ID ? '(set)' : '(not set)'}`);
-  console.log(`[Gateway] ANTHROPIC_API_KEY in envVars: ${envVars.ANTHROPIC_API_KEY ? '(set)' : '(not set)'}`);
-  console.log(`[Gateway] AI_GATEWAY_BASE_URL in envVars: ${envVars.AI_GATEWAY_BASE_URL || '(not set)'}`);
-  console.log(`[Gateway] OPENAI_API_KEY in envVars: ${envVars.OPENAI_API_KEY ? '(set)' : '(not set)'}`);
-  console.log(`[Gateway] Total env vars: ${Object.keys(envVars).length}`);
+  console.log(`[STARTUP] Gateway token: ${envVars.OPENCLAW_GATEWAY_TOKEN ? 'SET' : 'MISSING'}`);
+  console.log(`[STARTUP] R2 credentials: ${envVars.R2_ACCESS_KEY_ID ? 'SET' : 'MISSING'}`);
+  console.log(`[STARTUP] AI API key: ${envVars.ANTHROPIC_API_KEY ? 'SET' : envVars.OPENAI_API_KEY ? 'SET (OpenAI)' : 'MISSING'}`);
+  console.log(`[STARTUP] AI Gateway URL: ${envVars.AI_GATEWAY_BASE_URL || '(direct)'}`);
+  console.log(`[STARTUP] CaptainApp key: ${captainAppKey ? 'DERIVED' : 'MISSING'}`);
+  console.log(`[STARTUP] Total env vars: ${Object.keys(envVars).length}`);
 
   // Merge user secrets into env vars for API keys only
   // Channel tokens (Telegram, Discord, Slack) are managed via the bot's control UI
@@ -199,47 +231,54 @@ async function doEnsureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv, userId:
   if (userSecrets.ANTHROPIC_API_KEY) envVars.ANTHROPIC_API_KEY = userSecrets.ANTHROPIC_API_KEY;
   if (userSecrets.OPENAI_API_KEY) envVars.OPENAI_API_KEY = userSecrets.OPENAI_API_KEY;
 
-  const command = '/usr/local/bin/start-moltbot.sh';
+  // CaptainApp: use derived key (automatic), fall back to R2 secret (manual override)
+  if (captainAppKey) {
+    envVars.CAPTAINAPP_API_KEY = captainAppKey;
+  } else if (userSecrets.CAPTAINAPP_API_KEY) {
+    envVars.CAPTAINAPP_API_KEY = userSecrets.CAPTAINAPP_API_KEY;
+  }
 
-  console.log('Starting process with command:', command);
-  console.log('Environment vars being passed:', Object.keys(envVars));
+  const command = '/usr/local/bin/start-moltbot.sh';
 
   let process: Process;
   try {
     process = await sandbox.startProcess(command, {
       env: Object.keys(envVars).length > 0 ? envVars : undefined,
     });
-    console.log('Process started with id:', process.id, 'status:', process.status);
+    console.log(`[STARTUP] Process started: id=${process.id} status=${process.status}`);
   } catch (startErr) {
-    console.error('Failed to start process:', startErr);
+    console.error('[STARTUP] Failed to start process:', startErr);
     throw startErr;
   }
 
   // Wait for the gateway to be ready
   try {
-    console.log('[Gateway] Waiting for Moltbot gateway to be ready on port', MOLTBOT_PORT);
+    console.log(`[STARTUP] Phase 4: Waiting for port ${MOLTBOT_PORT} (timeout: ${STARTUP_TIMEOUT_MS}ms)...`);
     await process.waitForPort(MOLTBOT_PORT, { mode: 'tcp', timeout: STARTUP_TIMEOUT_MS });
-    console.log('[Gateway] Moltbot gateway is ready!');
+
+    const totalDuration = Date.now() - startupStart;
+    console.log(`[STARTUP] ✅ Gateway ready in ${totalDuration}ms`);
 
     const logs = await process.getLogs();
-    if (logs.stdout) console.log('[Gateway] stdout:', logs.stdout);
-    if (logs.stderr) console.log('[Gateway] stderr:', logs.stderr);
+    if (logs.stdout) console.log('[STARTUP] stdout:', logs.stdout.slice(-500));
+    if (logs.stderr) console.log('[STARTUP] stderr:', logs.stderr.slice(-500));
   } catch (e) {
-    console.error('[Gateway] waitForPort failed:', e);
+    const totalDuration = Date.now() - startupStart;
+    console.error(`[STARTUP] ❌ Gateway failed after ${totalDuration}ms:`, e);
+
+    // Get detailed logs for debugging
     try {
       const logs = await process.getLogs();
-      console.error('[Gateway] startup failed. Stderr:', logs.stderr);
-      console.error('[Gateway] startup failed. Stdout:', logs.stdout);
-      throw new Error(`Moltbot gateway failed to start. Stderr: ${logs.stderr || '(empty)'}`);
+      console.error('[STARTUP] Failed startup - stderr:', logs.stderr);
+      console.error('[STARTUP] Failed startup - stdout:', logs.stdout);
+      throw new Error(`Gateway failed to start in ${STARTUP_TIMEOUT_MS}ms. Stderr: ${logs.stderr || '(empty)'}`);
     } catch (logErr) {
-      console.error('[Gateway] Failed to get logs:', logErr);
+      if (logErr instanceof Error && logErr.message.startsWith('Gateway failed')) throw logErr;
+      console.error('[STARTUP] Failed to get logs:', logErr);
       throw e;
     }
   }
 
-  // Verify gateway is actually responding
-  console.log('[Gateway] Verifying gateway health...');
-  
   return process;
 }
 

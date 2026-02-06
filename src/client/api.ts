@@ -178,6 +178,10 @@ export const SECRET_LABELS: Record<string, { label: string; hint: string }> = {
     label: 'OpenAI API Key',
     hint: 'For OpenAI model access',
   },
+  CAPTAINAPP_API_KEY: {
+    label: 'CaptainApp API Key',
+    hint: 'Metered model access (format: userId:apiKey)',
+  },
 };
 
 export async function getSecrets(): Promise<SecretsResponse> {

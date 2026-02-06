@@ -37,6 +37,7 @@ const MIGRATED_USERS = new Set<string>([
   '32c7100e-c6ce-4cf8-8b64-edf4ac3b760b', // Jack - standard-3
   '81bf6a68-28fe-48ef-b257-f9ad013e6298', // Josh - standard-2
   'fe56406b-a723-43cf-9f19-ba2ffcb135b0', // Miles - standard-2
+  '0f1195c1-6b57-4254-9871-6ef3b7fa360c', // Rhys - standard-1
 ]);
 
 /**
@@ -82,6 +83,13 @@ export function getSandboxForUser(env: MoltbotEnv, userId: string): MoltbotEnv['
     default:
       return env.SandboxStandard1 || env.Sandbox;
   }
+}
+
+/**
+ * Get the tier number for a user (for logging)
+ */
+export function getTierForUser(userId: string): number {
+  return USER_TIER_MAP[userId] || 1;
 }
 
 /**

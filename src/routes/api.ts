@@ -10,6 +10,7 @@ import {
   getGatewayMasterToken,
   getAllHealthStates,
   getRecentSyncResults,
+  getSandboxForUser,
 } from '../gateway';
 import { R2_MOUNT_PATH, getR2MountPathForUser } from '../config';
 import {
@@ -96,7 +97,8 @@ adminApi.get('/users', async (c) => {
         const sandboxName = `openclaw-${profile.id}`;
         try {
           const { getSandbox } = await import('@cloudflare/sandbox');
-          const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: false });
+          const sandboxBinding = getSandboxForUser(c.env, profile.id);
+          const sandbox = getSandbox(sandboxBinding, sandboxName, { keepAlive: false });
           // Try to list processes to see if sandbox exists
           const processes = await sandbox.listProcesses();
           return {
@@ -202,7 +204,8 @@ adminApi.get('/users/:userId', async (c) => {
     
     try {
       const { getSandbox } = await import('@cloudflare/sandbox');
-      const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: false });
+      const sandboxBinding = getSandboxForUser(c.env, userId);
+      const sandbox = getSandbox(sandboxBinding, sandboxName, { keepAlive: false });
       const processes = await sandbox.listProcesses();
       sandboxStatus = {
         name: sandboxName,
@@ -247,7 +250,8 @@ adminApi.post('/users/:userId/restart', async (c) => {
   const { getSandbox } = await import('@cloudflare/sandbox');
 
   const sandboxName = `openclaw-${userId}`;
-  const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: true });
+  const sandboxBinding = getSandboxForUser(c.env, userId);
+  const sandbox = getSandbox(sandboxBinding, sandboxName, { keepAlive: true });
 
   try {
     // IMPORTANT: Sync to R2 BEFORE killing processes to preserve current state
@@ -676,6 +680,7 @@ interface UserSecrets {
   SLACK_APP_TOKEN?: string;
   ANTHROPIC_API_KEY?: string;
   OPENAI_API_KEY?: string;
+  CAPTAINAPP_API_KEY?: string;
 }
 
 const SECRET_KEYS: (keyof UserSecrets)[] = [
@@ -685,6 +690,7 @@ const SECRET_KEYS: (keyof UserSecrets)[] = [
   'SLACK_APP_TOKEN',
   'ANTHROPIC_API_KEY',
   'OPENAI_API_KEY',
+  'CAPTAINAPP_API_KEY',
 ];
 
 function maskSecret(value: string | undefined): string | null {
@@ -881,8 +887,9 @@ adminApi.get('/users/:userId/debug', async (c) => {
   const targetUserId = c.req.param('userId');
   const { getSandbox } = await import('@cloudflare/sandbox');
 
-  // Get target user's sandbox
-  const targetSandbox = getSandbox(c.env.Sandbox, `openclaw-${targetUserId}`, { keepAlive: true });
+  // Get target user's sandbox with tiered routing
+  const targetSandboxBinding = getSandboxForUser(c.env, targetUserId);
+  const targetSandbox = getSandbox(targetSandboxBinding, `openclaw-${targetUserId}`, { keepAlive: true });
 
   try {
     const processes = await targetSandbox.listProcesses();
@@ -940,7 +947,8 @@ adminApi.post('/users/:userId/reset', async (c) => {
   const { getSandbox } = await import('@cloudflare/sandbox');
   const { ensureMoltbotGateway } = await import('../gateway');
 
-  const targetSandbox = getSandbox(c.env.Sandbox, `openclaw-${targetUserId}`, { keepAlive: true });
+  const targetSandboxBinding = getSandboxForUser(c.env, targetUserId);
+  const targetSandbox = getSandbox(targetSandboxBinding, `openclaw-${targetUserId}`, { keepAlive: true });
 
   try {
     // IMPORTANT: Sync to R2 BEFORE killing processes to preserve current state

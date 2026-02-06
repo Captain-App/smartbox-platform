@@ -35,6 +35,32 @@ export async function deriveUserGatewayToken(masterSecret: string, userId: strin
 }
 
 /**
+ * Derive a per-user CaptainApp API key using HMAC-SHA256.
+ * Format: "userId:derivedKey" — the proxy validates by re-deriving with the same master key.
+ *
+ * @param masterKey - The CAPTAINAPP_MASTER_KEY worker secret
+ * @param userId - The authenticated user's ID
+ * @returns API key in "userId:hex" format
+ */
+export async function deriveCaptainAppKey(masterKey: string, userId: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const keyData = encoder.encode(masterKey);
+  const message = encoder.encode(`captainapp-key:${userId}`);
+
+  const key = await crypto.subtle.importKey(
+    'raw',
+    keyData,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+
+  const signature = await crypto.subtle.sign('HMAC', key, message);
+  const hex = Array.from(new Uint8Array(signature)).map(b => b.toString(16).padStart(2, '0')).join('');
+  return `${userId}:${hex}`;
+}
+
+/**
  * Build environment variables to pass to the Moltbot container process
  *
  * @param env - Worker environment bindings

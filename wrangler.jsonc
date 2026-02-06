@@ -7,6 +7,8 @@
   "observability": {
     "enabled": true,
   },
+  "preview_urls": false,
+  "workers_dev": false,
   // Static assets for admin UI (built by vite)
   "assets": {
     "directory": "./dist/client",

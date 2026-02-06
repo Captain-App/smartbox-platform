@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
-import { findExistingMoltbotProcess, getGatewayMasterToken } from '../gateway';
+import { findExistingMoltbotProcess, getGatewayMasterToken, getSandboxForUser } from '../gateway';
 import { getRecentSyncResults, getConsecutiveSyncFailures } from '../gateway/sync';
 
 /**
@@ -20,7 +20,8 @@ debug.get('/admin/users/:userId/ps', async (c) => {
   const userId = c.req.param('userId');
   const { getSandbox } = await import('@cloudflare/sandbox');
   const sandboxName = `openclaw-${userId}`;
-  const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: false });
+  const sandboxBinding = getSandboxForUser(c.env, userId);
+  const sandbox = getSandbox(sandboxBinding, sandboxName, { keepAlive: false });
 
   try {
     const processes = await sandbox.listProcesses();
@@ -363,7 +364,8 @@ debug.get('/admin/users/:userId', async (c) => {
     let logs: string[] = [];
     
     try {
-      const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: false });
+      const sandboxBinding = getSandboxForUser(c.env, userId);
+  const sandbox = getSandbox(sandboxBinding, sandboxName, { keepAlive: false });
       const processes = await sandbox.listProcesses();
       sandboxStatus = {
         name: sandboxName,
@@ -405,7 +407,8 @@ debug.post('/admin/users/:userId/restart', async (c) => {
   const { restartContainer, isBackupFeatureEnabled } = await import('../gateway');
   
   const sandboxName = `openclaw-${userId}`;
-  const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: true });
+  const sandboxBinding = getSandboxForUser(c.env, userId);
+  const sandbox = getSandbox(sandboxBinding, sandboxName, { keepAlive: true });
 
   try {
     // Use the new restartContainer function which includes pre-shutdown sync
@@ -463,7 +466,8 @@ debug.post('/admin/users/:userId/kill-zombie', async (c) => {
   const userId = c.req.param('userId');
   const { getSandbox } = await import('@cloudflare/sandbox');
   const sandboxName = `openclaw-${userId}`;
-  const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: true });
+  const sandboxBinding = getSandboxForUser(c.env, userId);
+  const sandbox = getSandbox(sandboxBinding, sandboxName, { keepAlive: true });
 
   try {
     // Get all processes and kill them via sandbox API
@@ -616,7 +620,8 @@ debug.post('/admin/users/:userId/force-sync', async (c) => {
   const sandboxName = `openclaw-${userId}`;
 
   try {
-    const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: true });
+    const sandboxBinding = getSandboxForUser(c.env, userId);
+  const sandbox = getSandbox(sandboxBinding, sandboxName, { keepAlive: true });
     const r2Prefix = `users/${userId}`;
 
     // First check if container is running
@@ -662,7 +667,8 @@ debug.post('/admin/users/:userId/destroy', async (c) => {
   const sandboxName = `openclaw-${userId}`;
 
   try {
-    const sandbox = getSandbox(c.env.Sandbox, sandboxName, {
+    const sandboxBinding = getSandboxForUser(c.env, userId);
+    const sandbox = getSandbox(sandboxBinding, sandboxName, {
       keepAlive: false,
       containerTimeouts: {
         instanceGetTimeoutMS: 5000,
@@ -702,7 +708,8 @@ debug.post('/admin/users/:userId/add-group', async (c) => {
 
   const { getSandbox } = await import('@cloudflare/sandbox');
   const sandboxName = `openclaw-${userId}`;
-  const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: false });
+  const sandboxBinding = getSandboxForUser(c.env, userId);
+  const sandbox = getSandbox(sandboxBinding, sandboxName, { keepAlive: false });
 
   try {
     // Read current config
@@ -1192,7 +1199,8 @@ debug.post('/admin/users/:userId/fix-telegram', async (c) => {
   const userId = c.req.param('userId');
   const { getSandbox } = await import('@cloudflare/sandbox');
   const sandboxName = `openclaw-${userId}`;
-  const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: true });
+  const sandboxBinding = getSandboxForUser(c.env, userId);
+  const sandbox = getSandbox(sandboxBinding, sandboxName, { keepAlive: true });
 
   try {
     // Read current config
@@ -1351,7 +1359,8 @@ debug.get('/admin/users/:userId/config', async (c) => {
   const userId = c.req.param('userId');
   const { getSandbox } = await import('@cloudflare/sandbox');
   const sandboxName = `openclaw-${userId}`;
-  const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: true });
+  const sandboxBinding = getSandboxForUser(c.env, userId);
+  const sandbox = getSandbox(sandboxBinding, sandboxName, { keepAlive: true });
 
   try {
     const configProc = await sandbox.startProcess('cat /root/.openclaw/openclaw.json');
@@ -1420,7 +1429,8 @@ debug.get('/admin/users/:userId/sync-status', async (c) => {
     let r2Mounted = false;
 
     try {
-      const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: false });
+      const sandboxBinding = getSandboxForUser(c.env, userId);
+  const sandbox = getSandbox(sandboxBinding, sandboxName, { keepAlive: false });
       const processes = await sandbox.listProcesses();
       containerStatus = {
         available: true,
@@ -1587,7 +1597,8 @@ debug.get('/admin/users/:userId/env', async (c) => {
   const userId = c.req.param('userId');
   const { getSandbox } = await import('@cloudflare/sandbox');
   const sandboxName = `openclaw-${userId}`;
-  const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: true });
+  const sandboxBinding = getSandboxForUser(c.env, userId);
+  const sandbox = getSandbox(sandboxBinding, sandboxName, { keepAlive: true });
 
   try {
     const envProc = await sandbox.startProcess('env | grep -E "OPENCLAW|R2_|CLAWDBOT|TELEGRAM|DISCORD"');
@@ -1694,7 +1705,8 @@ debug.get('/admin/users/:userId/sessions', async (c) => {
   const sandboxName = `openclaw-${userId}`;
   
   try {
-    const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: false });
+    const sandboxBinding = getSandboxForUser(c.env, userId);
+  const sandbox = getSandbox(sandboxBinding, sandboxName, { keepAlive: false });
     
     // Session files are in ~/.openclaw/agents/*/sessions/
     const agentsDir = '/root/.openclaw/agents';
@@ -1856,7 +1868,8 @@ debug.get('/admin/users/:userId/sessions/:sessionId/messages', async (c) => {
   const sandboxName = `openclaw-${userId}`;
   
   try {
-    const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: false });
+    const sandboxBinding = getSandboxForUser(c.env, userId);
+  const sandbox = getSandbox(sandboxBinding, sandboxName, { keepAlive: false });
     
     // Find the session file in agents directory
     const findProc = await sandbox.startProcess(`find /root/.openclaw/agents -name "${sessionId}.jsonl" -type f 2>/dev/null`);
@@ -1964,7 +1977,8 @@ debug.get('/admin/users/:userId/logs', async (c) => {
   const lines = parseInt(c.req.query('lines') || '100', 10);
   const { getSandbox } = await import('@cloudflare/sandbox');
   const sandboxName = `openclaw-${userId}`;
-  const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: false });
+  const sandboxBinding = getSandboxForUser(c.env, userId);
+  const sandbox = getSandbox(sandboxBinding, sandboxName, { keepAlive: false });
 
   try {
     let targetProcess = null;
@@ -2026,7 +2040,8 @@ debug.post('/admin/users/:userId/exec', async (c) => {
 
   const { getSandbox } = await import('@cloudflare/sandbox');
   const sandboxName = `openclaw-${userId}`;
-  const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: false });
+  const sandboxBinding = getSandboxForUser(c.env, userId);
+  const sandbox = getSandbox(sandboxBinding, sandboxName, { keepAlive: false });
 
   try {
     console.log(`[Exec] Running command for ${userId}: ${command}`);
@@ -2063,7 +2078,8 @@ debug.get('/admin/users/:userId/status', async (c) => {
   const userId = c.req.param('userId');
   const { getSandbox } = await import('@cloudflare/sandbox');
   const sandboxName = `openclaw-${userId}`;
-  const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: false });
+  const sandboxBinding = getSandboxForUser(c.env, userId);
+  const sandbox = getSandbox(sandboxBinding, sandboxName, { keepAlive: false });
 
   try {
     const processes = await sandbox.listProcesses();
@@ -2122,7 +2138,8 @@ debug.post('/admin/users/:userId/config/read', async (c) => {
   
   const { getSandbox } = await import('@cloudflare/sandbox');
   const sandboxName = `openclaw-${userId}`;
-  const sandbox = getSandbox(c.env.Sandbox, sandboxName, { keepAlive: false });
+  const sandboxBinding = getSandboxForUser(c.env, userId);
+  const sandbox = getSandbox(sandboxBinding, sandboxName, { keepAlive: false });
 
   try {
     const proc = await sandbox.startProcess(`cat ${path}`);

@@ -45,6 +45,7 @@ const KNOWN_USER_IDS = [
   '5bb7d208-2baf-4c95-8aec-f28e016acedb', // david lippold
   'e29fd082-6811-4e29-893e-64699c49e1f0', // ben lippold
   'fe56406b-a723-43cf-9f19-ba2ffcb135b0', // miles
+  '81bf6a68-28fe-48ef-b257-f9ad013e6298', // josh
 ];
 
 // User name mapping for display
@@ -58,6 +59,7 @@ const USER_NAMES: Record<string, string> = {
   '5bb7d208-2baf-4c95-8aec-f28e016acedb': 'david_lippold',
   'e29fd082-6811-4e29-893e-64699c49e1f0': 'ben_lippold',
   'fe56406b-a723-43cf-9f19-ba2ffcb135b0': 'miles',
+  '81bf6a68-28fe-48ef-b257-f9ad013e6298': 'josh',
 };
 
 // Cost data interfaces

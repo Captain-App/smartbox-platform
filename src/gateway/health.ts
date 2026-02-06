@@ -3,6 +3,57 @@ import { MOLTBOT_PORT } from '../config';
 import { findExistingMoltbotProcess } from './process';
 import { waitForProcess } from './utils';
 
+// =============================================================================
+// Circuit Breaker: Prevent infinite restart loops
+// =============================================================================
+const restartCounts = new Map<string, { count: number; windowStart: number }>();
+const CIRCUIT_BREAKER_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+const CIRCUIT_BREAKER_THRESHOLD = 5; // Max 5 restarts in window
+
+/**
+ * Check if circuit breaker is tripped for a user
+ */
+export function isCircuitBreakerTripped(userId: string): boolean {
+  const now = Date.now();
+  const entry = restartCounts.get(userId);
+
+  if (!entry) return false;
+
+  // Reset window if expired
+  if (now - entry.windowStart > CIRCUIT_BREAKER_WINDOW_MS) {
+    restartCounts.delete(userId);
+    return false;
+  }
+
+  return entry.count >= CIRCUIT_BREAKER_THRESHOLD;
+}
+
+/**
+ * Increment restart count for circuit breaker
+ */
+export function recordRestartForCircuitBreaker(userId: string): void {
+  const now = Date.now();
+  const entry = restartCounts.get(userId);
+
+  if (!entry || now - entry.windowStart > CIRCUIT_BREAKER_WINDOW_MS) {
+    // Start new window
+    restartCounts.set(userId, { count: 1, windowStart: now });
+    console.log(`[CIRCUIT-BREAKER] ${userId.slice(0, 8)}: 1 restart in new window`);
+  } else {
+    // Increment in current window
+    entry.count++;
+    console.log(`[CIRCUIT-BREAKER] ${userId.slice(0, 8)}: ${entry.count} restarts in current window`);
+  }
+}
+
+/**
+ * Reset circuit breaker for a user (manual intervention)
+ */
+export function resetCircuitBreaker(userId: string): void {
+  restartCounts.delete(userId);
+  console.log(`[CIRCUIT-BREAKER] ${userId.slice(0, 8)}: reset`);
+}
+
 /**
  * Result of a health check for a single sandbox
  */
@@ -188,6 +239,12 @@ export async function checkHealth(
  * Check if a sandbox should be restarted based on health state
  */
 export function shouldRestart(userId: string, config: Partial<HealthCheckConfig> = {}): boolean {
+  // Check circuit breaker first
+  if (isCircuitBreakerTripped(userId)) {
+    console.warn(`[CIRCUIT-BREAKER] User ${userId.slice(0, 8)} circuit breaker tripped - manual intervention required`);
+    return false;
+  }
+
   const cfg = { ...DEFAULT_CONFIG, ...config };
   const state = healthStates.get(userId);
   if (!state) return false;

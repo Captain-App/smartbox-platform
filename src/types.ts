@@ -21,6 +21,7 @@ export interface MoltbotEnv {
   ANTHROPIC_API_KEY?: string;
   ANTHROPIC_BASE_URL?: string;
   OPENAI_API_KEY?: string;
+  CAPTAINAPP_MASTER_KEY?: string; // CaptainApp master key (derives per-user API keys)
   MOLTBOT_GATEWAY_MASTER_TOKEN?: string; // Gateway master token (derives per-user tokens)
   MOLTBOT_GATEWAY_TOKEN?: string; // @deprecated - use MOLTBOT_GATEWAY_MASTER_TOKEN
 

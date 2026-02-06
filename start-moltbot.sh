@@ -1,6 +1,6 @@
 #!/bin/bash
 # Startup script for Moltbot in Cloudflare Sandbox
-# v3: Fixed concurrent startup race condition with lockfile
+# v5: Removed tee logging to avoid subprocess issues in sandbox
 # This script:
 # 1. Restores config from R2 backup if available
 # 2. Configures moltbot from environment variables
@@ -8,17 +8,22 @@
 
 set -e
 
+# NOTE: Removed tee-based logging (lines 14-15) because process substitution
+# creates subprocesses that get killed when the sandbox times out, causing
+# the startup script to fail. Stdout/stderr are captured by the sandbox anyway.
+
 STARTUP_LOCK="/tmp/moltbot-startup.lock"
 
 # Use flock to prevent concurrent startup attempts
 # If another startup is in progress, wait up to 30s then exit
 exec 200>"$STARTUP_LOCK"
 if ! flock -w 30 200; then
-    echo "Another startup is in progress, exiting."
+    echo "[$(date -Iseconds)] Another startup is in progress, exiting."
     exit 0
 fi
 
 echo "=== Moltbot Startup $(date -Iseconds) ==="
+echo "User ID: ${OPENCLAW_USER_ID:-'(not set)'}"
 
 # Check if openclaw gateway is already running - bail early if so
 if pgrep -f "openclaw gateway" > /dev/null 2>&1; then
@@ -76,15 +81,19 @@ fi
 echo "Config directory: $CONFIG_DIR"
 echo "Backup directory: $BACKUP_DIR"
 
-# Wait for R2 mount to be available (async mount can take time on tiered sandboxes)
+# Wait for R2 mount to be available (async mount can take time)
 echo "Waiting for R2 mount..."
 R2_WAIT=0
-MAX_WAIT=120  # Increased from 30 to 120 seconds for tiered sandboxes
+MAX_WAIT=30  # If mount takes > 30s, something is wrong
 while [ ! -d "$R2_MOUNT" ] && [ $R2_WAIT -lt $MAX_WAIT ]; do
     sleep 1
     R2_WAIT=$((R2_WAIT + 1))
     if [ $((R2_WAIT % 10)) -eq 0 ]; then
         echo "Waiting for R2... ($R2_WAIT/$MAX_WAIT)"
+        # Check if mount process exists
+        if ! pgrep -f "s3fs" > /dev/null; then
+            echo "WARNING: s3fs process not found - mount may have failed"
+        fi
     fi
 done
 
@@ -92,7 +101,10 @@ if [ -d "$R2_MOUNT" ]; then
     echo "R2 mounted at $R2_MOUNT after ${R2_WAIT}s"
     ls -la "$R2_MOUNT" | head -5
 else
-    echo "R2 mount not available after ${MAX_WAIT}s, continuing without backup restore"
+    echo "ERROR: R2 mount failed after ${MAX_WAIT}s"
+    echo "Checking mount table:"
+    mount | grep s3fs || echo "No s3fs mounts found"
+    echo "Continuing without R2 backup - container will use local storage only"
 fi
 
 # Create config directory
@@ -144,14 +156,34 @@ parse_timestamp_to_epoch() {
 }
 
 # Helper function to check if R2 backup is newer than local
+# IMPORTANT: Also forces restore if local config is missing or suspiciously small
 should_restore_from_r2() {
     local R2_SYNC_FILE="$BACKUP_DIR/.last-sync"
     local LOCAL_SYNC_FILE="$CONFIG_DIR/.last-sync"
+    local LOCAL_CONFIG="$CONFIG_DIR/openclaw.json"
 
-    # If no R2 sync timestamp, don't restore
+    # If no R2 sync timestamp, don't restore (nothing to restore from)
     if [ ! -f "$R2_SYNC_FILE" ]; then
         echo "No R2 sync timestamp found, skipping restore"
         return 1
+    fi
+
+    # CRITICAL: Always restore if no local config exists
+    if [ ! -f "$LOCAL_CONFIG" ]; then
+        echo "No local config file, will restore from R2"
+        return 0
+    fi
+
+    # CRITICAL: Always restore if local config is suspiciously small (likely empty/corrupted)
+    # A valid config should be at least 100 bytes (minimal JSON structure)
+    local CONFIG_SIZE=0
+    if [ -f "$LOCAL_CONFIG" ]; then
+        # Use stat with fallbacks for different systems
+        CONFIG_SIZE=$(stat -c%s "$LOCAL_CONFIG" 2>/dev/null || stat -f%z "$LOCAL_CONFIG" 2>/dev/null || echo "0")
+    fi
+    if [ "$CONFIG_SIZE" -lt 100 ]; then
+        echo "Local config too small ($CONFIG_SIZE bytes), will restore from R2"
+        return 0
     fi
 
     # If no local sync timestamp, restore from R2
@@ -188,12 +220,44 @@ if should_restore_from_r2; then
     SHOULD_RESTORE=true
 fi
 
+# ============================================================
+# MIGRATION: clawdbot -> openclaw
+# ============================================================
+# If user has legacy clawdbot data but no openclaw data, migrate automatically
+if [ -d "$BACKUP_DIR/clawdbot" ] && [ ! -d "$BACKUP_DIR/openclaw" ]; then
+    echo "=== MIGRATION: Copying clawdbot data to openclaw ==="
+    cp -a "$BACKUP_DIR/clawdbot" "$BACKUP_DIR/openclaw"
+    # Rename clawdbot.json to openclaw.json if it exists
+    if [ -f "$BACKUP_DIR/openclaw/clawdbot.json" ]; then
+        mv "$BACKUP_DIR/openclaw/clawdbot.json" "$BACKUP_DIR/openclaw/openclaw.json"
+        echo "Renamed clawdbot.json to openclaw.json"
+    fi
+    # Update .last-sync to force restore
+    echo "migration-$(date -Iseconds)" > "$BACKUP_DIR/.last-sync"
+    echo "Migration complete - will restore from openclaw directory"
+    SHOULD_RESTORE=true
+fi
+
+# DEBUG: Show what's in R2 before restore
+echo "=== DEBUG: Checking R2 contents ==="
+echo "BACKUP_DIR contents:"
+ls -la "$BACKUP_DIR/" 2>/dev/null | head -20 || echo "Cannot list BACKUP_DIR"
+echo ""
+echo "Looking for openclaw directory:"
+ls -la "$BACKUP_DIR/openclaw/" 2>/dev/null | head -10 || echo "No openclaw dir"
+echo ""
+echo "Looking for clawdbot directory:"
+ls -la "$BACKUP_DIR/clawdbot/" 2>/dev/null | head -10 || echo "No clawdbot dir"
+echo "=== END DEBUG ==="
+
 # Restore config from R2 backup
 if [ -f "$BACKUP_DIR/openclaw/openclaw.json" ]; then
     if [ "$SHOULD_RESTORE" = true ]; then
         echo "Restoring from R2 backup at $BACKUP_DIR/openclaw..."
         cp -a "$BACKUP_DIR/openclaw/." "$CONFIG_DIR/"
         echo "Restored config from R2 backup"
+    else
+        echo "openclaw.json exists but SHOULD_RESTORE=false"
     fi
 elif [ -f "$BACKUP_DIR/clawdbot/clawdbot.json" ]; then
     # Legacy backup format (clawdbot naming)
@@ -201,6 +265,8 @@ elif [ -f "$BACKUP_DIR/clawdbot/clawdbot.json" ]; then
         echo "Restoring from legacy R2 backup at $BACKUP_DIR/clawdbot..."
         cp -a "$BACKUP_DIR/clawdbot/." "$CONFIG_DIR/"
         echo "Restored config from legacy R2 backup"
+    else
+        echo "clawdbot.json exists but SHOULD_RESTORE=false"
     fi
 elif [ -f "$BACKUP_DIR/clawdbot.json" ]; then
     # Legacy backup format (flat structure)
@@ -287,7 +353,8 @@ config.agents = config.agents || {};
 config.agents.defaults = config.agents.defaults || {};
 config.agents.defaults.model = config.agents.defaults.model || {};
 config.gateway = config.gateway || {};
-config.channels = config.channels || {};
+// NOTE: Do NOT touch config.channels here - channels (Telegram, Discord, etc.)
+// are managed by the bot's control UI and restored from R2 backup.
 
 // Gateway configuration
 config.gateway.port = 18789;
@@ -361,8 +428,9 @@ if (isOpenAI) {
     config.agents.defaults.models['anthropic/claude-sonnet-4-5-20250929'] = { alias: 'Sonnet 4.5' };
     config.agents.defaults.models['anthropic/claude-haiku-4-5-20251001'] = { alias: 'Haiku 4.5' };
     config.agents.defaults.model.primary = 'anthropic/claude-opus-4-5-20251101';
-} else {
+} else if (!config.agents.defaults.model.primary) {
     // Default to Anthropic without custom base URL (uses built-in pi-ai catalog)
+    // Only set if no model was already configured (e.g., from R2 restore)
     config.agents.defaults.model.primary = 'anthropic/claude-opus-4-5';
 }
 
@@ -371,6 +439,32 @@ fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
 console.log('Configuration updated successfully');
 console.log('Channels configured:', Object.keys(config.channels || {}).join(', ') || 'none');
 EOFNODE
+
+# ============================================================
+# CREATE AUTH PROFILES FOR CUSTOM PROVIDERS
+# ============================================================
+# The agent dir auth-profiles.json is where openclaw resolves API keys at runtime.
+# Without this, models resolve but API calls fail with "No API key found".
+AGENT_DIR="/root/.openclaw/agents/main/agent"
+mkdir -p "$AGENT_DIR"
+
+if [ -n "$CAPTAINAPP_API_KEY" ]; then
+    echo "Creating auth profile for CaptainApp provider..."
+    node -e "
+const fs = require('fs');
+const authPath = '$AGENT_DIR/auth-profiles.json';
+let data = { version: 1, profiles: {} };
+try { data = JSON.parse(fs.readFileSync(authPath, 'utf8')); } catch {}
+data.profiles = data.profiles || {};
+data.profiles['captainapp-default'] = {
+    provider: 'captainapp',
+    type: 'api_key',
+    key: process.env.CAPTAINAPP_API_KEY
+};
+fs.writeFileSync(authPath, JSON.stringify(data));
+console.log('Auth profile written to', authPath);
+"
+fi
 
 # ============================================================
 # SHUTDOWN HANDLER (Zero-Data-Loss Protection)

@@ -1,5 +1,5 @@
 /**
- * OpenClaw - Multi-Tenant Bot Platform
+ * OpenClaw - Multi-Tenant Bot Platform (v2026.02.06)
  *
  * This Worker runs personal AI assistant instances in Cloudflare Sandbox containers.
  * Each authenticated user gets their own isolated sandbox and R2 storage.
@@ -41,10 +41,12 @@ import {
   checkHealth,
   shouldRestart,
   recordRestart,
+  recordRestartForCircuitBreaker,
   createDailyBackup,
   createRollingBackup,
   getSandboxForUser,
   getInstanceTypeName,
+  getTierForUser,
   runPostRestartVerification,
   restartContainer,
 } from './gateway';
@@ -165,8 +167,8 @@ function getSandboxNameForRequest(c: { get: (key: 'user') => AuthenticatedUser |
 // Skip sandbox init for debug/admin routes - they create their own sandbox instances
 app.use('*', async (c, next) => {
   const url = new URL(c.req.url);
-  if (url.pathname.startsWith('/debug/admin/')) {
-    // Debug admin routes handle their own sandbox instances
+  if (url.pathname.startsWith('/debug/admin/') || url.pathname.startsWith('/api/super/')) {
+    // Debug admin and super admin routes handle their own sandbox instances
     return next();
   }
 
@@ -902,7 +904,15 @@ async function scheduled(
     const r2Prefix = `users/${userId}`;
 
     try {
-      const sandbox = getSandbox(env.Sandbox, sandboxName, options);
+      // Use tiered routing for sandbox binding
+      const sandboxBinding = getSandboxForUser(env, userId);
+      const tier = getTierForUser(userId);
+      const sandbox = getSandbox(sandboxBinding, sandboxName, options);
+
+      const bindingName = sandboxBinding === env.SandboxStandard3 ? 'standard-3' :
+                          sandboxBinding === env.SandboxStandard2 ? 'standard-2' :
+                          sandboxBinding === env.SandboxStandard1 ? 'standard-1' : 'legacy';
+      console.log(`[cron] Processing user ${userId.slice(0, 8)} on tier ${tier} (binding: ${bindingName})`);
 
       // Check if sandbox has any processes
       const processes = await sandbox.listProcesses();
@@ -984,6 +994,9 @@ async function scheduled(
           }
 
           try {
+            // Record restart for circuit breaker tracking
+            recordRestartForCircuitBreaker(userId);
+
             // Use restartContainer which includes pre-shutdown sync (when enabled)
             const restartResult = await restartContainer(sandbox, env, userId);
 

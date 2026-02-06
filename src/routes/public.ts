@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { getSandbox, type SandboxOptions } from '@cloudflare/sandbox';
 import type { AppEnv, MoltbotEnv } from '../types';
 import { MOLTBOT_PORT, HEALTH_CHECK_CONFIG } from '../config';
-import { findExistingMoltbotProcess, checkHealth, getHealthState, getRecentSyncResults } from '../gateway';
+import { findExistingMoltbotProcess, checkHealth, getHealthState, getRecentSyncResults, getSandboxForUser, getTierForUser } from '../gateway';
 import { verifySupabaseJWT } from '../../platform/auth/supabase-jwt';
 
 /**
@@ -60,8 +60,9 @@ publicRoutes.get('/api/status', async (c) => {
         userId = decoded.sub;
         const sandboxName = `openclaw-${userId}`;
         const options = buildSandboxOptions(c.env);
-        sandbox = getSandbox(c.env.Sandbox, sandboxName, options);
-        console.log(`[API/status] Using authenticated user sandbox: ${sandboxName}`);
+        const sandboxBinding = getSandboxForUser(c.env, userId);
+        sandbox = getSandbox(sandboxBinding, sandboxName, options);
+        console.log(`[API/status] Using authenticated user sandbox: ${sandboxName} (tier: ${getTierForUser(userId)})`);
       }
     }
   } catch (err) {
@@ -153,7 +154,8 @@ publicRoutes.get('/api/super/users/:userId/inspect', async (c) => {
 
   try {
     const options = buildSandboxOptions(c.env);
-    const sandbox = getSandbox(c.env.Sandbox, sandboxName, options);
+    const sandboxBinding = getSandboxForUser(c.env, userId);
+    const sandbox = getSandbox(sandboxBinding, sandboxName, options);
 
     // Get processes
     const processes = await sandbox.listProcesses();
@@ -248,7 +250,8 @@ publicRoutes.get('/api/super/users/:userId/files', async (c) => {
 
   try {
     const options = buildSandboxOptions(c.env);
-    const sandbox = getSandbox(c.env.Sandbox, sandboxName, options);
+    const sandboxBinding = getSandboxForUser(c.env, userId);
+    const sandbox = getSandbox(sandboxBinding, sandboxName, options);
 
     // Run ls commands to check file system state
     let commands = [
@@ -307,7 +310,8 @@ publicRoutes.get('/api/super/users/:userId/sync', async (c) => {
 
   try {
     const options = buildSandboxOptions(c.env);
-    const sandbox = getSandbox(c.env.Sandbox, sandboxName, options);
+    const sandboxBinding = getSandboxForUser(c.env, userId);
+    const sandbox = getSandbox(sandboxBinding, sandboxName, options);
 
     // Run sync commands manually with full debug output
     const commands = [
@@ -372,7 +376,8 @@ publicRoutes.post('/api/super/users/:userId/exec', async (c) => {
     }
 
     const options = buildSandboxOptions(c.env);
-    const sandbox = getSandbox(c.env.Sandbox, sandboxName, options);
+    const sandboxBinding = getSandboxForUser(c.env, userId);
+    const sandbox = getSandbox(sandboxBinding, sandboxName, options);
 
     const proc = await sandbox.startProcess(command);
     let attempts = 0;
@@ -405,23 +410,16 @@ publicRoutes.get('/api/super/users/:userId/restart', async (c) => {
 
   try {
     const options = buildSandboxOptions(c.env);
-    const sandbox = getSandbox(c.env.Sandbox, sandboxName, options);
+    const sandboxBinding = getSandboxForUser(c.env, userId);
+    const sandbox = getSandbox(sandboxBinding, sandboxName, options);
 
-    // IMPORTANT: Sync to R2 BEFORE killing processes to preserve current state
-    // This ensures that when the container restarts, it loads the latest config
-    let syncResult: { success: boolean; error?: string } = { success: false, error: 'not attempted' };
-    try {
-      const { syncToR2 } = await import('../gateway');
-      console.log(`[RESTART] Syncing user ${userId} to R2 before restart...`);
-      syncResult = await syncToR2(sandbox, c.env, { r2Prefix: `users/${userId}` });
-      console.log(`[RESTART] Pre-restart sync result:`, syncResult.success ? 'success' : syncResult.error);
-    } catch (syncErr) {
-      console.error(`[RESTART] Pre-restart sync failed:`, syncErr);
-      syncResult = { success: false, error: syncErr instanceof Error ? syncErr.message : 'Unknown error' };
-    }
+    // SKIP PRE-SYNC - just kill and restart for speed
+    // Rely on post-startup restore from R2 (cron syncs every 60s anyway)
+    console.log(`[RESTART] Skipping pre-sync for ${userId.slice(0, 8)} (will restore from R2 on startup)`);
 
     // Kill all processes
     const processes = await sandbox.listProcesses();
+    console.log(`[RESTART] Killing ${processes.length} processes...`);
     for (const proc of processes) {
       try { await proc.kill(); } catch (e) { /* ignore */ }
     }
@@ -432,16 +430,7 @@ publicRoutes.get('/api/super/users/:userId/restart', async (c) => {
     await sandbox.startProcess('rm -f /tmp/openclaw-gateway.lock /root/.openclaw/gateway.lock 2>/dev/null');
     await new Promise(r => setTimeout(r, 500));
 
-    // Run doctor --fix first
-    const doctorProc = await sandbox.startProcess('openclaw doctor --fix --yes 2>&1');
-    let attempts = 0;
-    while (doctorProc.status === 'running' && attempts < 30) {
-      await new Promise(r => setTimeout(r, 500));
-      attempts++;
-    }
-    const doctorLogs = await doctorProc.getLogs();
-
-    // Start gateway
+    // Start gateway - will restore from R2 automatically
     const { ensureMoltbotGateway } = await import('../gateway');
     const bootPromise = ensureMoltbotGateway(sandbox, c.env, userId).catch((e) => console.error('Gateway start error:', e));
     c.executionCtx.waitUntil(bootPromise);
@@ -450,9 +439,7 @@ publicRoutes.get('/api/super/users/:userId/restart', async (c) => {
       success: true,
       userId,
       sandboxName,
-      preRestartSync: syncResult,
-      doctor: doctorLogs.stdout || doctorLogs.stderr,
-      message: 'Gateway restarting...',
+      message: 'Gateway restarting (recovery from R2 on startup)...',
     });
   } catch (error) {
     return c.json({

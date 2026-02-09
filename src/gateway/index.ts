@@ -1,5 +1,7 @@
 export { buildEnvVars, deriveUserGatewayToken, getGatewayMasterToken } from './env';
-export { mountR2Storage } from './r2';
+export { backupToR2, restoreFromR2 } from './tar-backup';
+export type { TarBackupResult, TarRestoreResult } from './tar-backup';
+export { presignR2Url, presignRestoreUrl, presignBackupUrl } from './presign';
 export { findExistingMoltbotProcess, ensureMoltbotGateway, restartContainer } from './process';
 export { createDailyBackup, createRollingBackup, listBackupDates, restoreUserFromBackup } from './backup';
 export { syncToR2, getRecentSyncResults, getConsecutiveSyncFailures, syncCriticalFilesToR2, syncBeforeShutdown } from './sync';

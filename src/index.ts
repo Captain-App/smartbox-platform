@@ -871,19 +871,9 @@ async function scheduled(
 ): Promise<void> {
   console.log('[cron] Starting health checks and backup sync...');
 
-  // List all users from R2 bucket
-  const userIds = new Set<string>();
-  try {
-    const listed = await env.MOLTBOT_BUCKET.list({ prefix: 'users/' });
-    for (const obj of listed.objects) {
-      const match = obj.key.match(/^users\/([^/]+)\//);
-      if (match) {
-        userIds.add(match[1]);
-      }
-    }
-  } catch (err) {
-    console.error('[cron] Failed to list users from R2:', err);
-  }
+  // Use the hardcoded user registry — it's the single source of truth
+  const { getActiveUserIds } = await import('./lib/user-registry');
+  const userIds = new Set<string>(getActiveUserIds());
 
   console.log(`[cron] Found ${userIds.size} users to check`);
 
@@ -914,43 +904,30 @@ async function scheduled(
                           sandboxBinding === env.SandboxStandard1 ? 'standard-1' : 'legacy';
       console.log(`[cron] Processing user ${userId.slice(0, 8)} on tier ${tier} (binding: ${bindingName})`);
 
-      // Check if sandbox has any processes
+      // Check if gateway is running
       const processes = await sandbox.listProcesses();
-      if (processes.length === 0) {
-        // No processes - check if user has Telegram configured and auto-start if so
-        try {
-          const configKey = `users/${userId}/openclaw/openclaw.json`;
-          const configObj = await env.MOLTBOT_BUCKET.get(configKey);
-          if (configObj) {
-            const configText = await configObj.text();
-            const config = JSON.parse(configText);
-            const hasTelegram = config?.channels?.telegram?.botToken;
-
-            if (hasTelegram) {
-              console.log(`[cron] Auto-starting gateway for ${sandboxName} - has Telegram configured but no processes`);
-              try {
-                await ensureMoltbotGateway(sandbox, env, userId);
-                console.log(`[cron] Auto-started gateway for ${sandboxName}`);
-                restartCount++;
-                // Continue to health check and sync
-              } catch (startErr) {
-                console.error(`[cron] Failed to auto-start ${sandboxName}:`, startErr);
-                issues.push({ userId, type: 'auto_start_failed', error: startErr instanceof Error ? startErr.message : 'Unknown error' });
-                skippedCount++;
-                continue;
-              }
-            } else {
-              console.log(`[cron] Skipping ${sandboxName} - no active processes and no Telegram`);
-              skippedCount++;
-              continue;
-            }
-          } else {
-            console.log(`[cron] Skipping ${sandboxName} - no active processes and no config`);
+      const gatewayRunning = processes.some((p: any) =>
+        (p.command?.includes('openclaw gateway') || p.command?.includes('openclaw-gateway') || p.command?.includes('start-moltbot.sh')) &&
+        p.status === 'running'
+      );
+      
+      if (!gatewayRunning) {
+        // Gateway not running — check if user has a backup (meaning they've been set up)
+        const backupHead = await env.MOLTBOT_BUCKET.head(`users/${userId}/backup.tar.gz`);
+        if (backupHead && backupHead.size > 200) {
+          console.log(`[cron] Auto-starting gateway for ${sandboxName} — has ${Math.round(backupHead.size / 1024)}KB backup but no gateway`);
+          try {
+            await ensureMoltbotGateway(sandbox, env, userId);
+            console.log(`[cron] Auto-started gateway for ${sandboxName}`);
+            restartCount++;
+          } catch (startErr) {
+            console.error(`[cron] Failed to auto-start ${sandboxName}:`, startErr);
+            issues.push({ userId, type: 'auto_start_failed', error: startErr instanceof Error ? startErr.message : 'Unknown error' });
             skippedCount++;
             continue;
           }
-        } catch (configErr) {
-          console.log(`[cron] Skipping ${sandboxName} - failed to check config: ${configErr}`);
+        } else {
+          console.log(`[cron] Skipping ${sandboxName} — no gateway and no backup`);
           skippedCount++;
           continue;
         }

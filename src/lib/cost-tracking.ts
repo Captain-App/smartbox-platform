@@ -34,33 +34,11 @@ export const COST_RATES = {
   },
 } as const;
 
-// List of all user IDs for cost tracking
-const KNOWN_USER_IDS = [
-  '38b1ec2b-7a70-4834-a48d-162b8902b0fd', // kyla
-  '32c7100e-c6ce-4cf8-8b64-edf4ac3b760b', // jack
-  '6d575ef4-7ac8-4a17-b732-e0e690986e58', // david geddes
-  '0f1195c1-6b57-4254-9871-6ef3b7fa360c', // rhys
-  '679f60a6-2e00-403b-86f1-f4696149294f', // james
-  'aef3677b-afdf-4a7e-bbeb-c596f0d94d29', // adnan
-  '5bb7d208-2baf-4c95-8aec-f28e016acedb', // david lippold
-  'e29fd082-6811-4e29-893e-64699c49e1f0', // ben lippold
-  'fe56406b-a723-43cf-9f19-ba2ffcb135b0', // miles
-  '81bf6a68-28fe-48ef-b257-f9ad013e6298', // josh
-];
+import { getActiveUserIds, getUserNames } from './user-registry';
 
-// User name mapping for display
-const USER_NAMES: Record<string, string> = {
-  '38b1ec2b-7a70-4834-a48d-162b8902b0fd': 'kyla',
-  '32c7100e-c6ce-4cf8-8b64-edf4ac3b760b': 'jack',
-  '6d575ef4-7ac8-4a17-b732-e0e690986e58': 'david_geddes',
-  '0f1195c1-6b57-4254-9871-6ef3b7fa360c': 'rhys',
-  '679f60a6-2e00-403b-86f1-f4696149294f': 'james',
-  'aef3677b-afdf-4a7e-bbeb-c596f0d94d29': 'adnan',
-  '5bb7d208-2baf-4c95-8aec-f28e016acedb': 'david_lippold',
-  'e29fd082-6811-4e29-893e-64699c49e1f0': 'ben_lippold',
-  'fe56406b-a723-43cf-9f19-ba2ffcb135b0': 'miles',
-  '81bf6a68-28fe-48ef-b257-f9ad013e6298': 'josh',
-};
+// Use shared registry for user IDs and names
+const KNOWN_USER_IDS = getActiveUserIds();
+const USER_NAMES = getUserNames();
 
 // Cost data interfaces
 export interface UserCostBreakdown {

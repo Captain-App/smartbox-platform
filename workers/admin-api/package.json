@@ -1,0 +1,21 @@
+{
+  "name": "@moltworker/admin-api",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Admin API Worker for fleet management with Durable Object-backed exec results",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@moltworker/shared": "file:../../packages/shared",
+    "hono": "^4.11.6"
+  },
+  "devDependencies": {
+    "@cloudflare/sandbox": "^0.7.0",
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.50.0"
+  }
+}

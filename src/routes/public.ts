@@ -241,12 +241,11 @@ publicRoutes.get('/api/super/users/:userId/inspect', async (c) => {
 });
 
 // GET /api/super/users/:userId/files - TEMPORARY: Check file system in user's container
-// Add ?sync=1 to also run backup
+// Add ?sync=1 to also run backup via tar
 publicRoutes.get('/api/super/users/:userId/files', async (c) => {
   const userId = c.req.param('userId');
   const sandboxName = `openclaw-${userId}`;
   const doSync = c.req.query('sync') === '1';
-  const mountPath = `/data/openclaw/users/${userId}`;
 
   try {
     const options = buildSandboxOptions(c.env);
@@ -254,23 +253,10 @@ publicRoutes.get('/api/super/users/:userId/files', async (c) => {
     const sandbox = getSandbox(sandboxBinding, sandboxName, options);
 
     // Run ls commands to check file system state
-    let commands = [
+    const commands = [
       'ls -la /root/.openclaw/ 2>&1 | head -20',
       'cat /root/.openclaw/openclaw.json 2>&1 | head -50',
-      'mount | grep s3fs',
-      'ls -la /data/openclaw/ 2>&1 | head -10',
     ];
-
-    // If sync requested, add sync commands
-    if (doSync) {
-      commands = commands.concat([
-        `mkdir -p ${mountPath}/openclaw ${mountPath}/skills`,
-        `rsync -r --no-times --delete --exclude='*.lock' --exclude='*.log' --exclude='*.tmp' /root/.openclaw/ ${mountPath}/openclaw/ 2>&1`,
-        `date -Iseconds > ${mountPath}/.last-sync`,
-        `cat ${mountPath}/.last-sync`,
-        `ls -la ${mountPath}/ 2>&1`,
-      ]);
-    }
 
     const results: Record<string, string> = {};
 
@@ -287,6 +273,13 @@ publicRoutes.get('/api/super/users/:userId/files', async (c) => {
       } catch (e) {
         results[cmd] = `Error: ${e instanceof Error ? e.message : 'Unknown'}`;
       }
+    }
+
+    // If sync requested, run tar-based backup via Worker
+    if (doSync) {
+      const { syncToR2 } = await import('../gateway');
+      const syncResult = await syncToR2(sandbox, c.env, { r2Prefix: `users/${userId}` });
+      results['tar-backup'] = JSON.stringify(syncResult);
     }
 
     return c.json({
@@ -306,94 +299,24 @@ publicRoutes.get('/api/super/users/:userId/files', async (c) => {
 publicRoutes.get('/api/super/users/:userId/sync', async (c) => {
   const userId = c.req.param('userId');
   const sandboxName = `openclaw-${userId}`;
-  const mountPath = `/data/openclaw/users/${userId}`;
 
   try {
     const options = buildSandboxOptions(c.env);
     const sandboxBinding = getSandboxForUser(c.env, userId);
     const sandbox = getSandbox(sandboxBinding, sandboxName, options);
 
-    // Run sync commands manually with full debug output
-    const commands = [
-      // Check source exists
-      'test -f /root/.openclaw/openclaw.json && echo "source_ok" || echo "source_missing"',
-      // Create target directory
-      `mkdir -p ${mountPath}/openclaw ${mountPath}/skills`,
-      // Run rsync with verbose
-      `rsync -rv --no-times --delete --exclude='*.lock' --exclude='*.log' --exclude='*.tmp' /root/.openclaw/ ${mountPath}/openclaw/ 2>&1`,
-      // Write timestamp
-      `date -Iseconds > ${mountPath}/.last-sync && cat ${mountPath}/.last-sync`,
-      // Verify
-      `ls -la ${mountPath}/`,
-    ];
-
-    const results: Record<string, string> = {};
-
-    for (const cmd of commands) {
-      try {
-        const proc = await sandbox.startProcess(cmd);
-        let attempts = 0;
-        while (proc.status === 'running' && attempts < 30) {
-          await new Promise(r => setTimeout(r, 500));
-          attempts++;
-        }
-        const logs = await proc.getLogs();
-        results[cmd.slice(0, 60)] = (logs.stdout || '') + (logs.stderr || '');
-      } catch (e) {
-        results[cmd.slice(0, 60)] = `Error: ${e instanceof Error ? e.message : 'Unknown'}`;
-      }
-    }
-
-    // Check if sync was successful
-    const lastSync = results[`date -Iseconds > ${mountPath}/.last-sync && cat ${mountPath}`];
-    const success = lastSync && lastSync.match(/^\d{4}-\d{2}-\d{2}/);
+    // Run tar-based backup via Worker
+    const { syncToR2 } = await import('../gateway');
+    const result = await syncToR2(sandbox, c.env, { r2Prefix: `users/${userId}` });
 
     return c.json({
-      success: !!success,
+      success: result.success,
       userId,
       sandboxName,
-      lastSync: success ? lastSync.trim() : null,
-      debug: results,
-    });
-  } catch (error) {
-    return c.json({
-      error: error instanceof Error ? error.message : 'Unknown error',
-      userId,
-    }, 500);
-  }
-});
-
-// POST /api/super/users/:userId/exec - Run a command in the user's container
-publicRoutes.post('/api/super/users/:userId/exec', async (c) => {
-  const userId = c.req.param('userId');
-  const sandboxName = `openclaw-${userId}`;
-
-  try {
-    const body = await c.req.json();
-    const command = body.command;
-    if (!command) {
-      return c.json({ error: 'Missing command' }, 400);
-    }
-
-    const options = buildSandboxOptions(c.env);
-    const sandboxBinding = getSandboxForUser(c.env, userId);
-    const sandbox = getSandbox(sandboxBinding, sandboxName, options);
-
-    const proc = await sandbox.startProcess(command);
-    let attempts = 0;
-    while (proc.status === 'running' && attempts < 60) {
-      await new Promise(r => setTimeout(r, 500));
-      attempts++;
-    }
-    const logs = await proc.getLogs();
-
-    return c.json({
-      userId,
-      command,
-      status: proc.status,
-      exitCode: proc.exitCode,
-      stdout: logs.stdout,
-      stderr: logs.stderr,
+      lastSync: result.lastSync || null,
+      syncId: result.syncId,
+      durationMs: result.durationMs,
+      error: result.error,
     });
   } catch (error) {
     return c.json({

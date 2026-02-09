@@ -1,0 +1,39 @@
+{
+  "userId": "81bf6a68-28fe-48ef-b257-f9ad013e6298",
+  "name": "josh",
+  "tier": "standard-3",
+  "checkIns": [
+    {
+      "at": "2026-02-07T13:38:06Z",
+      "state": "idle",
+      "processes": 0,
+      "healthy": false
+    },
+    {
+      "at": "2026-02-07T13:39:09Z",
+      "state": "active",
+      "processes": 4,
+      "healthy": true
+    },
+    {
+      "at": "2026-02-08T12:48:00Z",
+      "state": "active",
+      "processes": 17,
+      "healthy": true
+    }
+  ],
+  "alerts": [
+    {
+      "at": "2026-02-07T13:38Z",
+      "type": "recovery",
+      "message": "Container restarted successfully after idle detection"
+    }
+  ],
+  "notes": "Active superyacht research user",
+  "lastCheckIn": {
+    "at": "2026-02-08T12:48:00Z",
+    "state": "active",
+    "processes": 17,
+    "healthy": true
+  }
+}

@@ -3,7 +3,6 @@ import type { AppEnv } from '../types';
 import {
   ensureMoltbotGateway,
   findExistingMoltbotProcess,
-  mountR2Storage,
   syncToR2,
   waitForProcess,
   deriveUserGatewayToken,
@@ -12,7 +11,6 @@ import {
   getRecentSyncResults,
   getSandboxForUser,
 } from '../gateway';
-import { R2_MOUNT_PATH, getR2MountPathForUser } from '../config';
 import {
   getUnresolvedIssues,
   getRecentIssues,
@@ -462,34 +460,25 @@ adminApi.get('/storage', async (c) => {
   if (!c.env.CF_ACCOUNT_ID) missing.push('CF_ACCOUNT_ID');
 
   let lastSync: string | null = null;
-  let backupFiles: string[] = [];
+  let backupInfo: { key: string; size: number; uploaded?: string }[] = [];
 
-  // Determine the user-specific mount path
-  const userMountPath = user?.r2Prefix
-    ? getR2MountPathForUser(user.r2Prefix)
-    : R2_MOUNT_PATH;
-
-  // If R2 is configured, check for last sync timestamp
-  if (hasCredentials) {
+  // Check R2 directly via API (no FUSE mount needed)
+  if (hasCredentials && user?.r2Prefix) {
     try {
-      // Mount R2 if not already mounted (with user prefix)
-      await mountR2Storage(sandbox, c.env, { r2Prefix: user?.r2Prefix });
-
-      // Check for sync marker file
-      const proc = await sandbox.startProcess(`cat ${userMountPath}/.last-sync 2>/dev/null || echo ""`);
-      await waitForProcess(proc, 5000);
-      const logs = await proc.getLogs();
-      const timestamp = logs.stdout?.trim();
-      if (timestamp && timestamp !== '') {
-        lastSync = timestamp;
+      // Check for sync marker
+      const syncMarker = await c.env.MOLTBOT_BUCKET.get(`${user.r2Prefix}/.last-sync`);
+      if (syncMarker) {
+        lastSync = await syncMarker.text();
       }
 
-      // List what's in the backup directory
-      const listProc = await sandbox.startProcess(`ls -la ${userMountPath}/ 2>/dev/null | head -20`);
-      await waitForProcess(listProc, 5000);
-      const listLogs = await listProc.getLogs();
-      if (listLogs.stdout) {
-        backupFiles = listLogs.stdout.split('\n').filter(l => l.trim());
+      // Check for backup.tar.gz
+      const backupHead = await c.env.MOLTBOT_BUCKET.head(`${user.r2Prefix}/backup.tar.gz`);
+      if (backupHead) {
+        backupInfo.push({
+          key: 'backup.tar.gz',
+          size: backupHead.size,
+          uploaded: backupHead.uploaded?.toISOString(),
+        });
       }
     } catch {
       // Ignore errors checking sync status
@@ -500,8 +489,7 @@ adminApi.get('/storage', async (c) => {
     configured: hasCredentials,
     missing: missing.length > 0 ? missing : undefined,
     lastSync,
-    mountPath: userMountPath,
-    backupFiles,
+    backupInfo,
     message: hasCredentials
       ? 'R2 storage is configured. Your data will persist across container restarts.'
       : 'R2 storage is not configured. Paired devices and conversations will be lost when the container restarts.',

@@ -16,7 +16,8 @@
 const fs = require('fs');
 const path = require('path');
 
-const distDir = '/usr/local/lib/node_modules/openclaw/dist';
+// Fixed: use @captain-app scoped package path
+const distDir = '/usr/local/lib/node_modules/@captain-app/openclaw/dist';
 
 // Recursively collect all .js files in distDir (including subdirs like plugin-sdk/)
 function collectJsFiles(dir) {

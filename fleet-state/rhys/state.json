@@ -1,0 +1,27 @@
+{
+  "userId": "0f1195c1-6b57-4254-9871-6ef3b7fa360c",
+  "name": "rhys",
+  "tier": "standard-1",
+  "checkIns": [
+    {
+      "at": "2026-02-07T13:38:06Z",
+      "state": "active",
+      "processes": 68,
+      "healthy": true
+    },
+    {
+      "at": "2026-02-08T12:48:00Z",
+      "state": "active",
+      "processes": 10,
+      "healthy": true
+    }
+  ],
+  "alerts": [],
+  "notes": "Development work",
+  "lastCheckIn": {
+    "at": "2026-02-08T12:48:00Z",
+    "state": "active",
+    "processes": 10,
+    "healthy": true
+  }
+}

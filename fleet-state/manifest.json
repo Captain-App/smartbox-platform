@@ -1,0 +1,145 @@
+{
+  "version": 1,
+  "description": "Container fleet state tracking - current status and expected behavior for each user container",
+  "lastUpdated": "2026-02-07T13:35:00Z",
+  "users": {
+    "32c7100e-c6ce-4cf8-8b64-edf4ac3b760b": {
+      "name": "jack",
+      "tier": "standard-3",
+      "expectedState": "active",
+      "goals": [
+        "Maintain OpenClaw development and administration",
+        "Monitor container fleet health",
+        "Handle user support and pairing requests"
+      ],
+      "checkIn": {
+        "lastSeen": null,
+        "status": null,
+        "notes": null
+      }
+    },
+    "81bf6a68-28fe-48ef-b257-f9ad013e6298": {
+      "name": "josh",
+      "tier": "standard-3",
+      "expectedState": "active",
+      "goals": [
+        "Superyacht research and document processing",
+        "Maintain active Telegram connection"
+      ],
+      "checkIn": {
+        "lastSeen": "2026-02-07T13:38:06Z",
+        "status": "idle-unexpected",
+        "notes": "Container idle but should be active - woke via restart-async"
+      }
+    },
+    "fe56406b-a723-43cf-9f19-ba2ffcb135b0": {
+      "name": "miles",
+      "tier": "standard-1",
+      "expectedState": "active",
+      "goals": [
+        "General OpenClaw usage",
+        "Document and task management"
+      ],
+      "checkIn": {
+        "lastSeen": null,
+        "status": null,
+        "notes": null
+      }
+    },
+    "38b1ec2b-7a70-4834-a48d-162b8902b0fd": {
+      "name": "kyla",
+      "tier": "standard-1",
+      "expectedState": "active",
+      "goals": [
+        "Personal task management",
+        "Calendar and reminder integration"
+      ],
+      "checkIn": {
+        "lastSeen": null,
+        "status": null,
+        "notes": null
+      }
+    },
+    "0f1195c1-6b57-4254-9871-6ef3b7fa360c": {
+      "name": "rhys",
+      "tier": "standard-1",
+      "expectedState": "active",
+      "goals": [
+        "Development work",
+        "Project tracking"
+      ],
+      "checkIn": {
+        "lastSeen": null,
+        "status": null,
+        "notes": null
+      }
+    },
+    "e29fd082-6811-4e29-893e-64699c49e1f0": {
+      "name": "ben_lippold",
+      "tier": "standard-1",
+      "expectedState": "active",
+      "goals": [
+        "Personal productivity",
+        "Task and note management"
+      ],
+      "checkIn": {
+        "lastSeen": null,
+        "status": null,
+        "notes": null
+      }
+    },
+    "6d575ef4-7ac8-4a17-b732-e0e690986e58": {
+      "name": "david_geddes",
+      "tier": "standard-1",
+      "expectedState": "active",
+      "goals": [
+        "Document processing",
+        "Research tasks"
+      ],
+      "checkIn": {
+        "lastSeen": null,
+        "status": null,
+        "notes": null
+      }
+    },
+    "aef3677b-afdf-4a7e-bbeb-c596f0d94d29": {
+      "name": "adnan",
+      "tier": "standard-1",
+      "expectedState": "idle-ok",
+      "goals": [
+        "On-demand usage - container can sleep when not active"
+      ],
+      "checkIn": {
+        "lastSeen": null,
+        "status": null,
+        "notes": "Currently idle - no recent activity"
+      }
+    },
+    "5bb7d208-2baf-4c95-8aec-f28e016acedb": {
+      "name": "david_lippold",
+      "tier": "standard-1",
+      "expectedState": "idle-ok",
+      "goals": [
+        "On-demand usage - container can sleep when not active"
+      ],
+      "checkIn": {
+        "lastSeen": null,
+        "status": null,
+        "notes": "Currently idle - no recent activity"
+      }
+    },
+    "f1647b02-c311-49c3-9c72-48b8fc5da350": {
+      "name": "joe_james",
+      "tier": "standard-1",
+      "expectedState": "idle-ok",
+      "goals": [
+        "On-demand usage - container can sleep when not active"
+      ],
+      "checkIn": {
+        "lastSeen": null,
+        "status": null,
+        "notes": "Currently idle - no recent activity"
+      }
+    }
+  }
+}

@@ -7,7 +7,6 @@
 
 import type { Sandbox } from '@cloudflare/sandbox';
 import type { MoltbotEnv } from '../types';
-import { getR2MountPathForUser, R2_MOUNT_PATH } from '../config';
 import { isCriticalPath, VERIFICATION_CONFIG } from '../config/backup';
 
 /**

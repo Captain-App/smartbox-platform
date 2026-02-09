@@ -1,0 +1,27 @@
+{
+  "userId": "32c7100e-c6ce-4cf8-8b64-edf4ac3b760b",
+  "name": "jack",
+  "tier": "standard-3",
+  "checkIns": [
+    {
+      "at": "2026-02-07T13:38:06Z",
+      "state": "active",
+      "processes": 2300,
+      "healthy": true
+    },
+    {
+      "at": "2026-02-08T12:48:00Z",
+      "state": "active",
+      "processes": 620,
+      "healthy": true
+    }
+  ],
+  "alerts": [],
+  "notes": "Owner container - should always be active",
+  "lastCheckIn": {
+    "at": "2026-02-08T12:48:00Z",
+    "state": "active",
+    "processes": 620,
+    "healthy": true
+  }
+}

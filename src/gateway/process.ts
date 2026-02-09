@@ -2,7 +2,8 @@ import type { Sandbox, Process } from '@cloudflare/sandbox';
 import type { MoltbotEnv } from '../types';
 import { MOLTBOT_PORT, STARTUP_TIMEOUT_MS } from '../config';
 import { buildEnvVars, deriveCaptainAppKey, deriveUserGatewayToken, getGatewayMasterToken } from './env';
-import { mountR2Storage } from './r2';
+import { restoreFromR2 } from './tar-backup';
+import { presignRestoreUrl, presignBackupUrl } from './presign';
 import { syncBeforeShutdown, syncToR2 } from './sync';
 import { isBackupFeatureEnabled } from '../config/backup';
 import { getTierForUser } from './tiers';
@@ -130,25 +131,52 @@ async function doEnsureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv, userId:
   console.log(`[STARTUP] Starting gateway for ${tierInfo}`);
   console.log(`[STARTUP] Sandbox: ${sandboxName}`);
 
-  // Mount R2 storage (fire-and-forget - don't block startup)
-  // R2 is used as a backup - the startup script will restore from it on boot
-  console.log('[STARTUP] Phase 1: Initiating R2 mount (non-blocking)...');
-  const r2MountStart = Date.now();
-  const r2MountPromise = mountR2Storage(sandbox, env)
-    .then(success => {
-      const duration = Date.now() - r2MountStart;
-      if (success) {
-        console.log(`[STARTUP] R2 mount succeeded in ${duration}ms`);
+  // ── Phase 1: Generate presigned URLs for container self-restore ──
+  // Instead of downloading backup.tar.gz through the Worker (base64 piping,
+  // timeouts), we generate a presigned R2 URL and let the container's startup
+  // script download directly via curl. Faster, simpler, more reliable.
+  //
+  // Security: each URL is scoped to ONE object (this user's backup) and
+  // expires in 5 minutes. Container never sees R2 credentials.
+  console.log('[STARTUP] Phase 1: Generating presigned restore URL...');
+  let restoreUrl: string | null = null;
+  let backupUrl: string | null = null;
+  try {
+    if (userId) {
+      restoreUrl = await presignRestoreUrl(env, userId, 300);
+      backupUrl = await presignBackupUrl(env, userId, 3600); // 1h for backup (periodic)
+      if (restoreUrl) {
+        console.log(`[STARTUP] Presigned restore URL generated for user ${userId.slice(0, 8)}...`);
       } else {
-        console.warn(`[STARTUP] R2 mount failed after ${duration}ms - using degraded mode`);
+        console.warn('[STARTUP] Could not generate presigned URL — falling back to Worker-side restore');
       }
-      return success;
-    })
-    .catch(err => {
-      console.error('[STARTUP] R2 mount error:', err);
-      return false;
-    });
-  // Don't await - gateway starts immediately while R2 mounts in background
+    }
+  } catch (err) {
+    console.warn('[STARTUP] Presigned URL generation failed, falling back to Worker-side restore:', err);
+  }
+
+  // Fallback: Worker-side restore if presigned URL not available
+  if (!restoreUrl) {
+    console.log('[STARTUP] Falling back to Worker-side R2 restore (blocking, 15s timeout)...');
+    const restoreStart = Date.now();
+    try {
+      const r2Prefix = userId ? `users/${userId}` : 'default';
+      const restorePromise = restoreFromR2(sandbox, env, r2Prefix);
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Restore timed out after 15s')), 15_000)
+      );
+      const restoreResult = await Promise.race([restorePromise, timeoutPromise]);
+      const restoreDuration = Date.now() - restoreStart;
+      if (restoreResult.success) {
+        console.log(`[STARTUP] R2 restore completed in ${restoreDuration}ms (format: ${restoreResult.format})`);
+      } else {
+        console.warn(`[STARTUP] R2 restore failed after ${restoreDuration}ms: ${restoreResult.error} — starting with what's available`);
+      }
+    } catch (err) {
+      const restoreDuration = Date.now() - restoreStart;
+      console.error(`[STARTUP] R2 restore error after ${restoreDuration}ms:`, err);
+    }
+  }
 
   // Ensure user is registered in R2 for cron discovery
   // This writes a marker file so the cron can find new users
@@ -218,8 +246,21 @@ async function doEnsureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv, userId:
   // Start a new Moltbot gateway
   console.log('[STARTUP] Phase 3: Starting new gateway process...');
   const envVars = buildEnvVars(env, userGatewayToken, userId);
+
+  // Inject presigned URLs — container handles its own restore/backup
+  if (restoreUrl) envVars.RESTORE_URL = restoreUrl;
+  if (backupUrl) envVars.BACKUP_URL = backupUrl;
+
+  // Remove raw R2 credentials from container env — presigned URLs are safer
+  // (each URL is scoped to one object and expires quickly)
+  if (restoreUrl) {
+    delete envVars.R2_ACCESS_KEY_ID;
+    delete envVars.R2_SECRET_ACCESS_KEY;
+  }
+
   console.log(`[STARTUP] Gateway token: ${envVars.OPENCLAW_GATEWAY_TOKEN ? 'SET' : 'MISSING'}`);
-  console.log(`[STARTUP] R2 credentials: ${envVars.R2_ACCESS_KEY_ID ? 'SET' : 'MISSING'}`);
+  console.log(`[STARTUP] Restore URL: ${restoreUrl ? 'SET (presigned)' : 'MISSING (Worker-side restore used)'}`);
+  console.log(`[STARTUP] Backup URL: ${backupUrl ? 'SET (presigned)' : 'MISSING'}`);
   console.log(`[STARTUP] AI API key: ${envVars.ANTHROPIC_API_KEY ? 'SET' : envVars.OPENAI_API_KEY ? 'SET (OpenAI)' : 'MISSING'}`);
   console.log(`[STARTUP] AI Gateway URL: ${envVars.AI_GATEWAY_BASE_URL || '(direct)'}`);
   console.log(`[STARTUP] CaptainApp key: ${captainAppKey ? 'DERIVED' : 'MISSING'}`);
@@ -359,28 +400,25 @@ export async function restartContainer(
     console.error(`[Restart] Error killing processes for ${userId.slice(0, 8)}...:`, e);
   }
 
-  // Step 3: Start fresh gateway
+  // Step 3: Start fresh gateway (MUST await — unawaited promises die with DO context)
   try {
     console.log(`[Restart] Starting fresh gateway for ${userId.slice(0, 8)}...`);
-    
-    // Start in background - don't await to avoid timeout
-    ensureMoltbotGateway(sandbox, env, userId).catch(err => {
-      console.error(`[Restart] Gateway start failed for ${userId.slice(0, 8)}...:`, err);
-    });
-    
+
+    await ensureMoltbotGateway(sandbox, env, userId);
+
     return {
       success: true,
       syncResult,
-      message: 'Container restart initiated',
+      message: 'Container restarted and gateway running',
     };
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : 'Unknown error';
-    console.error(`[Restart] Failed to start gateway for ${userId.slice(0, 8)}...:`, errorMsg);
-    
+    console.error(`[Restart] Gateway start failed for ${userId.slice(0, 8)}...:`, errorMsg);
+
     return {
       success: false,
       syncResult,
-      message: `Restart failed: ${errorMsg}`,
+      message: `Restart failed (gateway may still be starting): ${errorMsg}`,
     };
   }
 }

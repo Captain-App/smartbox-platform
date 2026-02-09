@@ -1,51 +1,34 @@
 {
-  "name": "moltbot-sandbox",
+  "name": "moltworker-monorepo",
   "version": "1.0.0",
   "type": "module",
   "private": true,
-  "description": "Run Moltbot personal AI assistant in a Cloudflare Sandbox",
+  "description": "Moltworker architecture - multi-worker setup with Edge Router, Admin API, and Container Gateway",
+  "workspaces": [
+    "packages/*",
+    "workers/*"
+  ],
   "scripts": {
-    "build": "vite build",
-    "deploy": "npm run build && wrangler deploy",
-    "dev": "vite dev",
-    "start": "wrangler dev",
-    "types": "wrangler types",
-    "typecheck": "tsc --noEmit",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
-  },
-  "dependencies": {
-    "@cloudflare/puppeteer": "^1.0.5",
-    "hono": "^4.11.6",
-    "jose": "^6.0.0",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "build": "npm run build --workspaces",
+    "typecheck": "npm run typecheck --workspaces",
+    "deploy:shared": "cd packages/shared && npm run typecheck",
+    "deploy:admin-api": "cd workers/admin-api && wrangler deploy",
+    "deploy:container-gateway": "cd workers/container-gateway && wrangler deploy",
+    "deploy:router": "cd workers/router && wrangler deploy",
+    "deploy:all": "npm run deploy:admin-api && npm run deploy:container-gateway && npm run deploy:router",
+    "dev:admin-api": "cd workers/admin-api && wrangler dev",
+    "dev:container-gateway": "cd workers/container-gateway && wrangler dev",
+    "dev:router": "cd workers/router && wrangler dev",
+    "migration:enable-new": "node scripts/enable-new-architecture.mjs",
+    "migration:rollback": "node scripts/rollback-architecture.mjs",
+    "test:admin-api": "curl -s -H 'X-Admin-Secret: test' http://localhost:8787/api/super/users",
+    "test:router": "curl -s http://localhost:8787/health"
   },
   "devDependencies": {
-    "@cloudflare/sandbox": "*",
-    "@cloudflare/vite-plugin": "^1.0.0",
-    "@cloudflare/workers-types": "^4.20250109.0",
-    "@types/node": "^22.0.0",
-    "@types/react": "^19.0.0",
-    "@types/react-dom": "^19.0.0",
-    "@vitejs/plugin-react": "^4.3.0",
-    "@vitest/coverage-v8": "^4.0.18",
     "typescript": "^5.9.3",
-    "vite": "^6.0.0",
-    "vitest": "^4.0.18",
     "wrangler": "^4.50.0"
   },
-  "author": "",
-  "license": "Apache-2.0",
-  "cloudflare": {
-    "bindings": {
-      "ANTHROPIC_API_KEY": {
-        "description": "Your [Anthropic API key](https://console.anthropic.com/)."
-      },
-      "MOLTBOT_GATEWAY_MASTER_TOKEN": {
-        "description": "Token to protect gateway access. Random string, you can generate one with `openssl rand -base64 32`, for example."
-      }
-    }
+  "dependencies": {
+    "@cloudflare/puppeteer": "^1.0.6"
   }
 }

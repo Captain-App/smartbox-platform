@@ -32,7 +32,7 @@
   ],
   // Build command for vite
   "build": {
-    "command": "npm run build",
+    "command": "echo 'Skipping build — assets pre-built'",
   },
   // Container configuration for OpenClaw sandboxes
   // Each user gets their own sandbox instance (openclaw-{userId})

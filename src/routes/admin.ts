@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { getGatewayMasterToken } from '../gateway';
+import { getActiveUserIds, getUserNames, getUserRegistry, findUserByName } from '../lib/user-registry';
 
 /**
  * Admin API routes for managing user containers
@@ -13,14 +14,14 @@ const adminRouter = new Hono<AppEnv>();
 async function requireSuperAuth(c: any, next: () => Promise<void>) {
   const adminSecret = c.req.header('X-Admin-Secret');
   const expectedSecret = getGatewayMasterToken(c.env);
-  
+
   if (!adminSecret || adminSecret !== expectedSecret) {
-    return c.json({ 
+    return c.json({
       error: 'Super admin access required',
       hint: 'Provide X-Admin-Secret header'
     }, 403);
   }
-  
+
   await next();
 }
 
@@ -29,11 +30,11 @@ async function getUserSandbox(env: any, userId: string, keepAlive = false) {
   const { getSandbox } = await import('@cloudflare/sandbox');
   const { getSandboxForUser } = await import('../gateway/tiers');
   const sandboxName = `openclaw-${userId}`;
-  
+
   // Use tiered routing for migrated users, legacy for others
   const sandboxBinding = getSandboxForUser(env, userId);
-  
-  return getSandbox(sandboxBinding, sandboxName, { 
+
+  return getSandbox(sandboxBinding, sandboxName, {
     keepAlive,
     containerTimeouts: {
       instanceGetTimeoutMS: 30000,
@@ -71,22 +72,22 @@ interface LiveState {
 
 /**
  * Performs a synchronous live health check on a user's container
- * 
+ *
  * Steps:
  * 1. Get sandbox reference (fast, from DO namespace)
  * 2. List processes to check if any are running
  * 3. If processes exist, ping gateway port 18789
  * 4. Return state based on actual results
- * 
+ *
  * Performance Budget: <500ms for single container
  */
 async function getLiveState(userId: string, env: AppEnv): Promise<LiveState> {
   const startTime = Date.now();
-  
+
   try {
     // Step 1: Get sandbox reference (fast, from DO namespace)
     const sandbox = await getUserSandbox(env, userId, false);
-    
+
     // Step 2: List processes - lightweight operation (<100ms)
     let processes: any[] = [];
     try {
@@ -103,7 +104,7 @@ async function getLiveState(userId: string, env: AppEnv): Promise<LiveState> {
         error: processError instanceof Error ? processError.message : 'Failed to list processes',
       };
     }
-    
+
     // No processes = idle state
     if (processes.length === 0) {
       return {
@@ -115,10 +116,10 @@ async function getLiveState(userId: string, env: AppEnv): Promise<LiveState> {
         latencyMs: Date.now() - startTime,
       };
     }
-    
+
     // Step 3: Check gateway health on port 18789
     const gatewayHealthy = await checkGatewayHealth(sandbox);
-    
+
     // Step 4: Determine state based on gateway health
     return {
       state: gatewayHealthy ? 'active' : 'starting',
@@ -128,7 +129,7 @@ async function getLiveState(userId: string, env: AppEnv): Promise<LiveState> {
       checkedAt: new Date().toISOString(),
       latencyMs: Date.now() - startTime,
     };
-    
+
   } catch (error) {
     // Can't get sandbox reference = stopped
     return {
@@ -155,7 +156,7 @@ async function checkGatewayHealth(sandbox: any): Promise<boolean> {
       new Request('http://localhost:18789/'),
       18789
     );
-    
+
     // Any non-zero status means the server responded (even 404 is OK)
     return response.status > 0;
   } catch {
@@ -164,27 +165,34 @@ async function checkGatewayHealth(sandbox: any): Promise<boolean> {
   }
 }
 
-/**
- * Get all user IDs from the R2 bucket
- * Uses a hardcoded list of known users for reliable dashboard checks
- * This is more efficient than listing from R2 which has pagination/limitations
- */
-async function getAllUserIds(env: AppEnv): Promise<string[]> {
-  // Hardcoded list of known user IDs from user-lookup.json
-  // These are the 9 containers that should be monitored
-  return [
-    '38b1ec2b-7a70-4834-a48d-162b8902b0fd', // kyla
-    '32c7100e-c6ce-4cf8-8b64-edf4ac3b760b', // jack
-    '6d575ef4-7ac8-4a17-b732-e0e690986e58', // david geddes
-    '0f1195c1-6b57-4254-9871-6ef3b7fa360c', // rhys
-    '679f60a6-2e00-403b-86f1-f4696149294f', // james
-    'aef3677b-afdf-4a7e-bbeb-c596f0d94d29', // adnan
-    '5bb7d208-2baf-4c95-8aec-f28e016acedb', // david lippold
-    'e29fd082-6811-4e29-893e-64699c49e1f0', // ben lippold
-    'fe56406b-a723-43cf-9f19-ba2ffcb135b0', // miles
-    '81bf6a68-28fe-48ef-b257-f9ad013e6298', // josh
-  ];
+/** Get all active user IDs from the shared registry */
+async function getAllUserIdsFromRegistry(): Promise<string[]> {
+  return getActiveUserIds();
 }
+
+// =============================================================================
+// User Registry
+// =============================================================================
+
+// GET /api/super/users - List all registered users with names
+adminRouter.get('/users', requireSuperAuth, async (c) => {
+  const registry = getUserRegistry();
+  return c.json({
+    users: registry,
+    total: registry.length,
+    active: registry.filter(u => u.status === 'active').length,
+  });
+});
+
+// GET /api/super/users/lookup/:name - Look up user by name
+adminRouter.get('/users/lookup/:name', requireSuperAuth, async (c) => {
+  const name = c.req.param('name');
+  const user = findUserByName(name);
+  if (!user) {
+    return c.json({ error: `No user found matching "${name}"` }, 404);
+  }
+  return c.json(user);
+});
 
 // =============================================================================
 // Lightweight R2-Only Endpoints (Bypass DO - work even when DO is stuck)
@@ -201,21 +209,20 @@ adminRouter.get('/users/:id/r2-status', requireSuperAuth, async (c) => {
 
   try {
     const prefix = `users/${userId}/`;
-    console.log(`[R2-STATUS] Listing R2 objects with prefix: ${prefix}`);
-    const listed = await c.env.MOLTBOT_BUCKET.list({ prefix, limit: 100 });
-    console.log(`[R2-STATUS] Got ${listed.objects.length} objects`);
 
-    // Get sync markers
+    // Check for backup.tar.gz (new format)
+    const backupHead = await c.env.MOLTBOT_BUCKET.head(`${prefix}backup.tar.gz`);
+
+    // Check for legacy files to determine format
+    const legacyListed = await c.env.MOLTBOT_BUCKET.list({ prefix: `${prefix}root/`, limit: 1 });
+    const hasLegacyRoot = legacyListed.objects.length > 0;
+    const openlawListed = await c.env.MOLTBOT_BUCKET.list({ prefix: `${prefix}openclaw/`, limit: 1 });
+    const hasLegacyOpenclaw = openlawListed.objects.length > 0;
+
+    const backupFormat = backupHead ? 'tar' : hasLegacyRoot ? 'legacy-root' : hasLegacyOpenclaw ? 'legacy-openclaw' : 'none';
+
+    // Get sync marker
     const lastSync = await c.env.MOLTBOT_BUCKET.get(`${prefix}.last-sync`);
-    const lastSyncCritical = await c.env.MOLTBOT_BUCKET.get(`${prefix}.last-sync-critical`);
-    const lastSyncShutdown = await c.env.MOLTBOT_BUCKET.get(`${prefix}.last-sync-shutdown`);
-
-    // Get config
-    const configObj = await c.env.MOLTBOT_BUCKET.get(`${prefix}openclaw/openclaw.json`);
-    let config: any = null;
-    if (configObj) {
-      try { config = JSON.parse(await configObj.text()); } catch { /* ignore */ }
-    }
 
     // Get secrets keys (not values)
     const secretsObj = await c.env.MOLTBOT_BUCKET.get(`${prefix}secrets.json`);
@@ -227,16 +234,27 @@ adminRouter.get('/users/:id/r2-status', requireSuperAuth, async (c) => {
       } catch { /* ignore */ }
     }
 
-    // Parse last sync time (format may be "label|timestamp" or just "timestamp")
+    // Parse last sync time (format: "syncId|timestamp" or just "timestamp")
     const lastSyncText = lastSync ? await lastSync.text() : null;
     let syncTime: Date | null = null;
     let minutesSinceSync: number | null = null;
+    let syncId: string | null = null;
     if (lastSyncText) {
       try {
-        const timestampPart = lastSyncText.includes('|') ? lastSyncText.split('|')[1] : lastSyncText;
-        const parsed = new Date(timestampPart.trim());
-        if (!isNaN(parsed.getTime())) {
-          syncTime = parsed;
+        if (lastSyncText.includes('|')) {
+          const parts = lastSyncText.split('|');
+          syncId = parts[0];
+          const parsed = new Date(parts[1].trim());
+          if (!isNaN(parsed.getTime())) {
+            syncTime = parsed;
+          }
+        } else {
+          const parsed = new Date(lastSyncText.trim());
+          if (!isNaN(parsed.getTime())) {
+            syncTime = parsed;
+          }
+        }
+        if (syncTime) {
           minutesSinceSync = Math.round((Date.now() - syncTime.getTime()) / 60000);
         }
       } catch { /* ignore invalid dates */ }
@@ -244,23 +262,17 @@ adminRouter.get('/users/:id/r2-status', requireSuperAuth, async (c) => {
 
     return c.json({
       userId,
-      hasBackup: listed.objects.length > 0,
-      fileCount: listed.objects.length,
-      files: listed.objects.slice(0, 20).map(o => ({
-        key: o.key.replace(prefix, ''),
-        size: o.size,
-        uploaded: o.uploaded?.toISOString(),
-      })),
-      lastSync: syncTime?.toISOString() || null,
-      minutesSinceSync,
-      lastSyncCritical: lastSyncCritical ? await lastSyncCritical.text() : null,
-      lastSyncShutdown: lastSyncShutdown ? await lastSyncShutdown.text() : null,
-      config: config ? {
-        name: config.name,
-        model: config.model || config.agents?.defaults?.model?.primary,
-        personality: config.personality?.slice(0, 100),
-        gateway: config.gateway,
+      backupFormat,
+      hasBackup: backupFormat !== 'none',
+      backup: backupHead ? {
+        sizeBytes: backupHead.size,
+        sizeMB: Math.round(backupHead.size / 1024 / 1024 * 100) / 100,
+        uploaded: backupHead.uploaded?.toISOString(),
+        metadata: backupHead.customMetadata,
       } : null,
+      lastSync: syncTime?.toISOString() || null,
+      syncId,
+      minutesSinceSync,
       secrets: secretKeys,
       healthy: minutesSinceSync !== null && minutesSinceSync < 5,
     });
@@ -481,17 +493,17 @@ adminRouter.get('/users/:id/state', requireSuperAuth, async (c) => {
       // Try to list processes - if this fails, container is sleeping/stopped
       const processes = await sandbox.listProcesses();
       status.processCount = processes.length;
-      
+
       // Check if gateway is running
-      const gatewayProcess = processes.find((p: any) => 
-        p.command?.includes('openclaw gateway') && 
+      const gatewayProcess = processes.find((p: any) =>
+        p.command?.includes('openclaw gateway') &&
         (p.status === 'running' || p.status === 'starting')
       );
 
       if (gatewayProcess) {
         status.state = 'active';
         status.lastActivity = gatewayProcess.startTime?.toISOString() || null;
-        
+
         // Calculate uptime if we have a start time
         if (gatewayProcess.startTime) {
           const uptime = Math.floor((Date.now() - gatewayProcess.startTime.getTime()) / 1000);
@@ -562,7 +574,7 @@ adminRouter.get('/users/:id/state', requireSuperAuth, async (c) => {
 
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    return c.json({ 
+    return c.json({
       userId,
       state: 'error',
       error: errorMessage,
@@ -571,12 +583,52 @@ adminRouter.get('/users/:id/state', requireSuperAuth, async (c) => {
   }
 });
 
+// GET /api/super/users/:id/logs - Get gateway process logs
+adminRouter.get('/users/:id/logs', requireSuperAuth, async (c) => {
+  const userId = c.req.param('id');
+  try {
+    const sandbox = await getUserSandbox(c.env, userId, false);
+    const processes = await sandbox.listProcesses();
+    // Find gateway process - prefer running, fall back to most recent completed
+    let gatewayProcess = processes.find((p: any) =>
+      (p.command?.includes('start-moltbot.sh') || p.command?.includes('openclaw gateway') || p.command?.includes('openclaw-gateway')) &&
+      (p.status === 'running' || p.status === 'starting')
+    );
+    if (!gatewayProcess) {
+      // Fall back to most recently completed gateway process (for crash logs)
+      const completed = processes.filter((p: any) =>
+        (p.command?.includes('start-moltbot.sh') || p.command?.includes('openclaw gateway') || p.command?.includes('openclaw-gateway'))
+      );
+      gatewayProcess = completed[completed.length - 1] || null;
+    }
+    if (!gatewayProcess) {
+      return c.json({ userId, error: 'No gateway process found', processes: processes.map((p: any) => ({ id: p.id, command: p.command, status: p.status })) }, 404);
+    }
+    const logs = await gatewayProcess.getLogs();
+    const tail = parseInt(c.req.query('tail') || '200');
+    const stdoutLines = (logs.stdout || '').split('\n');
+    const stderrLines = (logs.stderr || '').split('\n');
+    return c.json({
+      userId,
+      processId: gatewayProcess.id,
+      command: gatewayProcess.command,
+      status: gatewayProcess.status,
+      stdout: stdoutLines.slice(-tail).join('\n'),
+      stderr: stderrLines.slice(-tail).join('\n'),
+      totalStdoutLines: stdoutLines.length,
+      totalStderrLines: stderrLines.length,
+    });
+  } catch (error) {
+    return c.json({ userId, error: error instanceof Error ? error.message : 'Unknown error' }, 500);
+  }
+});
+
 // GET /api/super/users/:id/state/v2 - Live synchronous state check
 adminRouter.get('/users/:id/state/v2', requireSuperAuth, async (c) => {
   const userId = c.req.param('id');
-  
+
   const state = await getLiveState(userId, c.env);
-  
+
   // Add last sync info from R2 if available
   try {
     const syncKey = `users/${userId}/.last-sync`;
@@ -588,17 +640,17 @@ adminRouter.get('/users/:id/state/v2', requireSuperAuth, async (c) => {
   } catch {
     // Ignore R2 errors
   }
-  
+
   return c.json(state);
 });
 
 // GET /api/super/state/dashboard - Batch status for all users
 adminRouter.get('/state/dashboard', requireSuperAuth, async (c) => {
   const startTime = Date.now();
-  
+
   // Get list of all users (from R2)
-  const userIds = await getAllUserIds(c.env);
-  
+  const userIds = await getAllUserIdsFromRegistry();
+
   if (userIds.length === 0) {
     return c.json({
       users: [],
@@ -614,16 +666,19 @@ adminRouter.get('/state/dashboard', requireSuperAuth, async (c) => {
       checkedAt: new Date().toISOString(),
     });
   }
-  
+
   // Check all containers in parallel
+  const names = getUserNames();
   const checks = await Promise.all(
     userIds.map(async (userId) => {
       try {
-        return await getLiveState(userId, c.env);
+        const state = await getLiveState(userId, c.env);
+        return { ...state, name: names[userId] || userId.slice(0, 8) };
       } catch (error) {
         return {
           state: 'error' as const,
           userId,
+          name: names[userId] || userId.slice(0, 8),
           processCount: 0,
           gatewayHealthy: null,
           checkedAt: new Date().toISOString(),
@@ -633,9 +688,9 @@ adminRouter.get('/state/dashboard', requireSuperAuth, async (c) => {
       }
     })
   );
-  
+
   const totalLatency = Date.now() - startTime;
-  
+
   return c.json({
     users: checks,
     summary: {
@@ -655,21 +710,21 @@ adminRouter.get('/state/dashboard', requireSuperAuth, async (c) => {
 adminRouter.post('/users/:id/wake', requireSuperAuth, async (c) => {
   const userId = c.req.param('id');
   const { ensureMoltbotGateway } = await import('../gateway');
-  
+
   try {
     const sandbox = await getUserSandbox(c.env, userId, true);
-    
+
     // Check current state
     let currentState: ContainerState = 'stopped';
     let existingProcess = null;
-    
+
     try {
       const processes = await sandbox.listProcesses();
-      existingProcess = processes.find((p: any) => 
-        p.command?.includes('openclaw gateway') && 
+      existingProcess = processes.find((p: any) =>
+        p.command?.includes('openclaw gateway') &&
         (p.status === 'running' || p.status === 'starting')
       );
-      
+
       if (existingProcess) {
         currentState = 'active';
       } else if (processes.length > 0) {
@@ -694,7 +749,7 @@ adminRouter.post('/users/:id/wake', requireSuperAuth, async (c) => {
 
     // Start the container
     console.log(`[WAKE] Waking up container for user ${userId}...`);
-    
+
     // Kill any stale processes first (batch)
     try {
       await sandbox.killAllProcesses();
@@ -716,17 +771,17 @@ adminRouter.post('/users/:id/wake', requireSuperAuth, async (c) => {
     const maxWaitMs = 60000;
     const pollIntervalMs = 2000;
     const startTime = Date.now();
-    
+
     while (Date.now() - startTime < maxWaitMs) {
       await new Promise(r => setTimeout(r, pollIntervalMs));
-      
+
       try {
         const processes = await sandbox.listProcesses();
-        const gatewayProcess = processes.find((p: any) => 
-          p.command?.includes('openclaw gateway') && 
+        const gatewayProcess = processes.find((p: any) =>
+          p.command?.includes('openclaw gateway') &&
           p.status === 'running'
         );
-        
+
         if (gatewayProcess) {
           return c.json({
             userId,
@@ -763,18 +818,18 @@ adminRouter.post('/users/:id/wake', requireSuperAuth, async (c) => {
 });
 
 // Auto-wake middleware helper
-async function withWake(env: any, userId: string, operation: () => Promise<Response>): Promise<Response> {
+async function withWake(env: any, userId: string, operation: () => Promise<Response>, executionCtx?: ExecutionContext): Promise<Response> {
   const sandbox = await getUserSandbox(env, userId, true);
-  
-  // Check if container needs waking
+
+  // Check if container needs waking — look for gateway process specifically
   let needsWake = false;
   try {
     const processes = await sandbox.listProcesses();
-    const gatewayRunning = processes.some((p: any) => 
-      p.command?.includes('openclaw gateway') && 
+    const gatewayRunning = processes.some((p: any) =>
+      (p.command?.includes('openclaw gateway') || p.command?.includes('openclaw-gateway') || p.command?.includes('start-moltbot.sh')) &&
       p.status === 'running'
     );
-    if (!gatewayRunning && processes.length === 0) {
+    if (!gatewayRunning) {
       needsWake = true;
     }
   } catch {
@@ -790,18 +845,22 @@ async function withWake(env: any, userId: string, operation: () => Promise<Respo
     try {
       await sandbox.killAllProcesses();
     } catch {}
-    
+
     await new Promise(r => setTimeout(r, 1000));
-    
+
     // Start gateway
     const bootPromise = ensureMoltbotGateway(sandbox, env, userId).catch(() => {});
-    env.executionCtx?.waitUntil?.(bootPromise);
     
+    // Use waitUntil if available to keep the worker alive
+    if (executionCtx?.waitUntil) {
+      executionCtx.waitUntil(bootPromise);
+    }
+
     // Wait for it to be ready
     const maxWaitMs = 30000;
     const pollIntervalMs = 1000;
     const startTime = Date.now();
-    
+
     while (Date.now() - startTime < maxWaitMs) {
       await new Promise(r => setTimeout(r, pollIntervalMs));
       try {
@@ -816,58 +875,99 @@ async function withWake(env: any, userId: string, operation: () => Promise<Respo
   return await operation();
 }
 
-// POST /api/super/users/:id/exec - Execute command with auto-wake
+// Store for async exec results (in-memory, per-worker)
+// For production, consider using Durable Objects or KV for persistence across workers
+const asyncExecResults = new Map<string, {
+  userId: string;
+  command: string;
+  status: 'running' | 'completed' | 'error';
+  exitCode?: number;
+  stdout: string;
+  stderr: string;
+  startedAt: string;
+  completedAt?: string;
+  error?: string;
+}>();
+
+// POST /api/super/users/:id/exec - Execute command synchronously (waits for result)
 adminRouter.post('/users/:id/exec', requireSuperAuth, async (c) => {
   const userId = c.req.param('id');
-  const body = await c.req.json().catch(() => ({}));
-  const { command, timeout = 30000, env: cmdEnv } = body;
+  
+  let body;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+  
+  const {
+    command,
+    timeout = 10000,
+    env: cmdEnv,
+    workingDir,
+  } = body;
 
   if (!command || typeof command !== 'string') {
     return c.json({ error: 'Command is required' }, 400);
   }
 
-  return await withWake(c.env, userId, async () => {
+  const fullCommand = workingDir
+    ? `cd ${workingDir} && ${command}`
+    : command;
+
+  try {
     const sandbox = await getUserSandbox(c.env, userId, true);
+    const proc = await sandbox.startProcess(fullCommand, { env: cmdEnv });
     
-    try {
-      // Execute the command
-      const startTime = Date.now();
-      const proc = await sandbox.startProcess(command, {
-        env: cmdEnv,
-      });
-
-      // Wait for completion or timeout
-      const result = await Promise.race([
-        proc.waitForExit(timeout),
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Command timeout')), timeout)
-        ),
-      ]);
-
-      const logs = await proc.getLogs();
-      const duration = Date.now() - startTime;
-
-      return c.json({
-        userId,
-        command,
-        exitCode: (result as any).exitCode ?? proc.exitCode ?? -1,
-        stdout: logs.stdout || '',
-        stderr: logs.stderr || '',
-        duration,
-        timestamp: new Date().toISOString(),
-      });
-
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      return c.json({
-        userId,
-        command,
-        error: errorMessage,
-        stdout: '',
-        stderr: '',
-        timestamp: new Date().toISOString(),
-      }, 500);
+    // Wait for completion with a hard timeout
+    const deadline = Date.now() + Math.min(timeout, 20000);
+    while (proc.status === 'running' && Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 300));
     }
+    
+    const logs = await proc.getLogs();
+    const timedOut = proc.status === 'running';
+    
+    return c.json({
+      userId,
+      command: fullCommand,
+      status: timedOut ? 'timeout' : 'completed',
+      exitCode: proc.exitCode ?? -1,
+      stdout: logs.stdout || '',
+      stderr: logs.stderr || '',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    return c.json({
+      userId,
+      command: fullCommand,
+      status: 'error',
+      error: error instanceof Error ? error.message : 'Unknown error',
+      timestamp: new Date().toISOString(),
+    }, 500);
+  }
+});
+
+// GET /api/super/users/:id/exec/:execId/status - Poll async exec status
+adminRouter.get('/users/:id/exec/:execId/status', requireSuperAuth, async (c) => {
+  const userId = c.req.param('id');
+  const execId = c.req.param('execId');
+
+  const result = asyncExecResults.get(execId);
+
+  if (!result) {
+    return c.json({
+      userId,
+      execId,
+      found: false,
+      error: 'Exec result not found. It may have expired or never existed.',
+    }, 404);
+  }
+
+  return c.json({
+    execId,
+    found: true,
+    ...result,
   });
 });
 
@@ -875,70 +975,54 @@ adminRouter.post('/users/:id/exec', requireSuperAuth, async (c) => {
 // Phase 1: Native File Operations
 // =============================================================================
 
-// GET /api/super/users/:id/files/:path{.+} - Read file using native SDK
+// GET /api/super/users/:id/files/:path{.+} - Read file from container
 adminRouter.get('/users/:id/files/:path{.+}', requireSuperAuth, async (c) => {
   const userId = c.req.param('id');
-  const path = c.req.param('path') || '';
-  
-  if (!path) {
+  const rawPath = c.req.param('path') || '';
+
+  if (!rawPath) {
     return c.json({ error: 'File path is required' }, 400);
   }
 
+  // Ensure path starts with / for absolute paths
+  const filePath = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
+
   return await withWake(c.env, userId, async () => {
     const sandbox = await getUserSandbox(c.env, userId, true);
-    
+
     try {
-      // Use native readFile SDK method
-      const result = await sandbox.readFile(path);
+      // Use cat via startProcess — most reliable across SDK versions
+      const { waitForProcess } = await import('../gateway/utils');
+      const proc = await sandbox.startProcess(`cat '${filePath}' 2>&1`);
+      await waitForProcess(proc, 5000);
+      const logs = await proc.getLogs();
       
-      if (!result.success) {
-        return c.json({
-          userId,
-          path,
-          error: 'Failed to read file',
-          exitCode: result.exitCode,
-        }, 500);
-      }
-
-      // For binary files or large files, return metadata only
-      if (result.isBinary || (result.size && result.size > 1024 * 1024)) {
-        return c.json({
-          userId,
-          path,
-          size: result.size,
-          encoding: result.encoding,
-          isBinary: result.isBinary,
-          mimeType: result.mimeType,
-          message: 'File is binary or large (>1MB). Use R2 for streaming.',
-        }, 200);
+      if (proc.exitCode !== 0) {
+        const stderr = logs.stderr || logs.stdout || '';
+        if (stderr.includes('No such file') || stderr.includes('not found')) {
+          return c.json({ userId, path: filePath, error: 'File not found' }, 404);
+        }
+        if (stderr.includes('Is a directory')) {
+          // It's a directory — list it instead
+          const lsProc = await sandbox.startProcess(`ls -la '${filePath}' 2>&1`);
+          await waitForProcess(lsProc, 5000);
+          const lsLogs = await lsProc.getLogs();
+          return c.json({ userId, path: filePath, type: 'directory', listing: lsLogs.stdout || '' });
+        }
+        return c.json({ userId, path: filePath, error: stderr }, 500);
       }
 
       return c.json({
         userId,
-        path,
-        content: result.content,
-        encoding: result.encoding,
-        size: result.size,
-        mimeType: result.mimeType,
-        timestamp: result.timestamp,
+        path: filePath,
+        content: logs.stdout || '',
+        timestamp: new Date().toISOString(),
       });
-
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      
-      // Check if file doesn't exist
-      if (errorMessage.includes('not found') || errorMessage.includes('No such file')) {
-        return c.json({
-          userId,
-          path,
-          error: 'File not found',
-        }, 404);
-      }
-      
       return c.json({
         userId,
-        path,
-        error: errorMessage,
+        path: filePath,
+        error: error instanceof Error ? error.message : 'Unknown error',
       }, 500);
     }
   });
@@ -948,17 +1032,17 @@ adminRouter.get('/users/:id/files/:path{.+}', requireSuperAuth, async (c) => {
 adminRouter.get('/users/:id/files/:path{.+}/exists', requireSuperAuth, async (c) => {
   const userId = c.req.param('id');
   const path = c.req.param('path') || '';
-  
+
   if (!path) {
     return c.json({ error: 'File path is required' }, 400);
   }
 
   return await withWake(c.env, userId, async () => {
     const sandbox = await getUserSandbox(c.env, userId, true);
-    
+
     try {
       const result = await sandbox.exists(path);
-      
+
       if (!result.success) {
         return c.json({
           userId,
@@ -989,7 +1073,7 @@ adminRouter.get('/users/:id/files/:path{.+}/exists', requireSuperAuth, async (c)
 adminRouter.put('/users/:id/files/:path{.+}', requireSuperAuth, async (c) => {
   const userId = c.req.param('id');
   const path = c.req.param('path') || '';
-  
+
   if (!path) {
     return c.json({ error: 'File path is required' }, 400);
   }
@@ -1009,7 +1093,7 @@ adminRouter.put('/users/:id/files/:path{.+}', requireSuperAuth, async (c) => {
 
   return await withWake(c.env, userId, async () => {
     const sandbox = await getUserSandbox(c.env, userId, true);
-    
+
     try {
       // Ensure directory exists
       const dirPath = path.substring(0, path.lastIndexOf('/')) || '/';
@@ -1019,7 +1103,7 @@ adminRouter.put('/users/:id/files/:path{.+}', requireSuperAuth, async (c) => {
 
       // Use native writeFile SDK method
       const result = await sandbox.writeFile(path, content);
-      
+
       if (!result.success) {
         return c.json({
           userId,
@@ -1063,17 +1147,17 @@ adminRouter.put('/users/:id/files/:path{.+}', requireSuperAuth, async (c) => {
 adminRouter.delete('/users/:id/files/:path{.+}', requireSuperAuth, async (c) => {
   const userId = c.req.param('id');
   const path = c.req.param('path') || '';
-  
+
   if (!path) {
     return c.json({ error: 'File path is required' }, 400);
   }
 
   return await withWake(c.env, userId, async () => {
     const sandbox = await getUserSandbox(c.env, userId, true);
-    
+
     try {
       const result = await sandbox.deleteFile(path);
-      
+
       if (!result.success) {
         return c.json({
           userId,
@@ -1104,38 +1188,34 @@ adminRouter.delete('/users/:id/files/:path{.+}', requireSuperAuth, async (c) => 
 // GET /api/super/users/:id/files - List files in directory
 adminRouter.get('/users/:id/files', requireSuperAuth, async (c) => {
   const userId = c.req.param('id');
-  const path = c.req.query('path') || '/';
+  const dirPath = c.req.query('path') || '/root';
   const recursive = c.req.query('recursive') === 'true';
 
   return await withWake(c.env, userId, async () => {
     const sandbox = await getUserSandbox(c.env, userId, true);
-    
+
     try {
-      const result = await sandbox.listFiles(path, { recursive });
-      
-      if (!result.success) {
-        return c.json({
-          userId,
-          path,
-          error: 'Failed to list files',
-          exitCode: result.exitCode,
-        }, 500);
-      }
+      const { waitForProcess } = await import('../gateway/utils');
+      const cmd = recursive
+        ? `find '${dirPath}' -type f 2>&1 | head -200`
+        : `ls -la '${dirPath}' 2>&1`;
+      const proc = await sandbox.startProcess(cmd);
+      await waitForProcess(proc, 10000);
+      const logs = await proc.getLogs();
 
       return c.json({
         userId,
-        path,
-        files: result.files,
-        count: result.count,
-        timestamp: result.timestamp,
+        path: dirPath,
+        recursive,
+        output: logs.stdout || '',
+        exitCode: proc.exitCode,
+        timestamp: new Date().toISOString(),
       });
-
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       return c.json({
         userId,
-        path,
-        error: errorMessage,
+        path: dirPath,
+        error: error instanceof Error ? error.message : 'Unknown error',
       }, 500);
     }
   });
@@ -1148,10 +1228,10 @@ adminRouter.get('/users/:id/files', requireSuperAuth, async (c) => {
 // POST /api/super/users/:id/config/reload - Trigger container to reload from R2
 adminRouter.post('/users/:id/config/reload', requireSuperAuth, async (c) => {
   const userId = c.req.param('id');
-  
+
   return await withWake(c.env, userId, async () => {
     const sandbox = await getUserSandbox(c.env, userId, true);
-    
+
     try {
       // Trigger the container to reload config from R2
       // This uses a signal or special command to tell the gateway to reload
@@ -1180,7 +1260,7 @@ adminRouter.post('/users/:id/config/reload', requireSuperAuth, async (c) => {
 // GET /api/super/users/:id/config - Get config from R2 (R2-first pattern)
 adminRouter.get('/users/:id/config', requireSuperAuth, async (c) => {
   const userId = c.req.param('id');
-  
+
   try {
     // Read from R2 first (R2-first pattern)
     const configKey = `users/${userId}/openclaw/openclaw.json`;
@@ -1236,7 +1316,7 @@ adminRouter.put('/users/:id/config', requireSuperAuth, async (c) => {
     // Store old version for rollback capability
     const configKey = `users/${userId}/openclaw/openclaw.json`;
     const historyKey = `users/${userId}/openclaw/openclaw.json.history`;
-    
+
     // Get existing config for history
     try {
       const existing = await c.env.MOLTBOT_BUCKET.get(configKey);
@@ -1246,7 +1326,7 @@ adminRouter.put('/users/:id/config', requireSuperAuth, async (c) => {
           timestamp: new Date().toISOString(),
           config: JSON.parse(existingText),
         };
-        
+
         // Append to history (simple approach - in production, consider limiting history size)
         const existingHistory = await c.env.MOLTBOT_BUCKET.get(historyKey);
         let history: any[] = [];
@@ -1256,12 +1336,12 @@ adminRouter.put('/users/:id/config', requireSuperAuth, async (c) => {
           } catch {}
         }
         history.push(historyEntry);
-        
+
         // Keep only last 10 versions
         if (history.length > 10) {
           history = history.slice(-10);
         }
-        
+
         await c.env.MOLTBOT_BUCKET.put(historyKey, JSON.stringify(history, null, 2), {
           httpMetadata: { contentType: 'application/json' },
         });
@@ -1279,7 +1359,7 @@ adminRouter.put('/users/:id/config', requireSuperAuth, async (c) => {
     // Trigger container reload
     return await withWake(c.env, userId, async () => {
       const sandbox = await getUserSandbox(c.env, userId, true);
-      
+
       // Write config to container as well
       try {
         await sandbox.mkdir('/root/.openclaw', { recursive: true });
@@ -1317,7 +1397,7 @@ adminRouter.put('/users/:id/config', requireSuperAuth, async (c) => {
 // GET /api/super/users/:id/config/history - Get config version history
 adminRouter.get('/users/:id/config/history', requireSuperAuth, async (c) => {
   const userId = c.req.param('id');
-  
+
   try {
     const historyKey = `users/${userId}/openclaw/openclaw.json.history`;
     const historyObj = await c.env.MOLTBOT_BUCKET.get(historyKey);
@@ -1428,10 +1508,10 @@ adminRouter.post('/users/:id/config/rollback', requireSuperAuth, async (c) => {
     // Update container
     return await withWake(c.env, userId, async () => {
       const sandbox = await getUserSandbox(c.env, userId, true);
-      
+
       try {
         await sandbox.writeFile('/root/.openclaw/openclaw.json', configText);
-        
+
         const reloadProc = await sandbox.startProcess('killall -HUP openclaw 2>/dev/null || true');
         await new Promise(r => setTimeout(r, 500));
         await reloadProc.getLogs();
@@ -1468,10 +1548,10 @@ adminRouter.get('/cost', requireSuperAuth, async (c) => {
   try {
     const days = parseInt(c.req.query('days') || '30', 10);
     const threshold = c.req.query('threshold') ? parseFloat(c.req.query('threshold')!) : undefined;
-    
+
     const { generateCostSummary } = await import('../lib/cost-tracking');
     const summary = await generateCostSummary(c.env, { days, threshold });
-    
+
     return c.json(summary);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -1482,23 +1562,23 @@ adminRouter.get('/cost', requireSuperAuth, async (c) => {
 // GET /api/super/cost/users/:id - Get cost breakdown for specific user
 adminRouter.get('/cost/users/:id', requireSuperAuth, async (c) => {
   const userId = c.req.param('id');
-  
+
   try {
     const days = parseInt(c.req.query('days') || '30', 10);
-    
+
     const { getUserCostSummary, generateCostSummary } = await import('../lib/cost-tracking');
     const userCost = await getUserCostSummary(c.env, userId, { days });
-    
+
     if (!userCost) {
       return c.json({ error: 'User not found' }, 404);
     }
-    
+
     // Get total for percentage calculation
     const totalSummary = await generateCostSummary(c.env, { days });
-    userCost.percentageOfTotal = totalSummary.totalCost > 0 
-      ? (userCost.totalCost / totalSummary.totalCost) * 100 
+    userCost.percentageOfTotal = totalSummary.totalCost > 0
+      ? (userCost.totalCost / totalSummary.totalCost) * 100
       : 0;
-    
+
     return c.json({
       userId,
       userName: userCost.userName,
@@ -1515,28 +1595,28 @@ adminRouter.get('/cost/users/:id', requireSuperAuth, async (c) => {
 // GET /api/super/cost/service/:service - Get cost breakdown by service type
 adminRouter.get('/cost/service/:service', requireSuperAuth, async (c) => {
   const service = c.req.param('service') as 'workers' | 'r2' | 'durableObjects' | 'sandbox';
-  
+
   if (!['workers', 'r2', 'durableObjects', 'sandbox'].includes(service)) {
     return c.json({ error: 'Invalid service type' }, 400);
   }
-  
+
   try {
     const days = parseInt(c.req.query('days') || '30', 10);
-    
+
     const { generateCostSummary } = await import('../lib/cost-tracking');
     const summary = await generateCostSummary(c.env, { days });
-    
+
     const serviceBreakdown = summary.serviceBreakdown.find(s => s.service === service);
-    
+
     if (!serviceBreakdown) {
       return c.json({ error: 'Service not found' }, 404);
     }
-    
+
     // Get per-user breakdown for this service
     const userBreakdown = summary.userBreakdown.map(u => ({
       userId: u.userId,
       userName: u.userName,
-      cost: service === 'workers' ? u.workers.cost : 
+      cost: service === 'workers' ? u.workers.cost :
             service === 'r2' ? u.r2.cost :
             service === 'durableObjects' ? u.durableObjects.cost : 0,
       details: service === 'workers' ? { requests: u.workers.requests, gbSeconds: u.workers.gbSeconds } :
@@ -1544,7 +1624,7 @@ adminRouter.get('/cost/service/:service', requireSuperAuth, async (c) => {
                service === 'durableObjects' ? { requests: u.durableObjects.requests, storageGB: u.durableObjects.storageGB } :
                {},
     }));
-    
+
     return c.json({
       service,
       period: summary.period,
@@ -1562,21 +1642,21 @@ adminRouter.get('/cost/service/:service', requireSuperAuth, async (c) => {
 adminRouter.get('/cost/trend', requireSuperAuth, async (c) => {
   try {
     const { generateCostSummary, getBillingPeriod } = await import('../lib/cost-tracking');
-    
+
     // Current period
     const currentDays = parseInt(c.req.query('days') || '30', 10);
     const currentSummary = await generateCostSummary(c.env, { days: currentDays });
-    
+
     // Previous period for comparison
     const prevPeriod = getBillingPeriod(currentDays);
     const prevStart = new Date(prevPeriod.start);
     prevStart.setDate(prevStart.getDate() - currentDays);
     const prevEnd = new Date(prevPeriod.start);
-    
+
     // Calculate mock previous period costs (would use historical data in production)
     // For now, estimate based on current trend
     const trendFactor = 0.95; // Assume 5% growth month-over-month as default
-    
+
     return c.json({
       current: {
         period: currentSummary.period,
@@ -1607,10 +1687,10 @@ adminRouter.get('/cost/check', requireSuperAuth, async (c) => {
   try {
     const threshold = parseFloat(c.req.query('threshold') || '50');
     const days = parseInt(c.req.query('days') || '30', 10);
-    
+
     const { checkCostThreshold } = await import('../lib/cost-tracking');
     const result = await checkCostThreshold(c.env, threshold, { days });
-    
+
     return c.json({
       check: {
         threshold,
@@ -1631,7 +1711,7 @@ adminRouter.get('/cost/check', requireSuperAuth, async (c) => {
 // GET /api/super/cost/rates - Get current pricing rates
 adminRouter.get('/cost/rates', requireSuperAuth, async (c) => {
   const { COST_RATES } = await import('../lib/cost-tracking');
-  
+
   return c.json({
     rates: COST_RATES,
     description: {
@@ -1739,7 +1819,7 @@ adminRouter.patch('/users/:id/config', requireSuperAuth, async (c) => {
       await new Promise(r => setTimeout(r, 500));
       await reloadProc.getLogs();
     } catch {
-      // Container may not be running — R2 config will be picked up on next start
+      // Container may not be running - R2 config will be picked up on next start
     }
 
     return c.json({
@@ -1778,7 +1858,7 @@ adminRouter.post('/bulk/config-patch', requireSuperAuth, async (c) => {
     return c.json({ error: 'patch object is required' }, 400);
   }
 
-  const allUserIds = await getAllUserIds(c.env);
+  const allUserIds = await getAllUserIdsFromRegistry();
   const targetIds = requestedIds && Array.isArray(requestedIds) ? requestedIds : allUserIds;
 
   const results: Array<{ userId: string; success: boolean; error?: string }> = [];
@@ -1837,7 +1917,7 @@ adminRouter.post('/bulk/restart', requireSuperAuth, async (c) => {
   }
 
   const { userIds: requestedIds, delayMs = 5000 } = body;
-  const allUserIds = await getAllUserIds(c.env);
+  const allUserIds = await getAllUserIdsFromRegistry();
   const targetIds = requestedIds && Array.isArray(requestedIds) ? requestedIds : allUserIds;
 
   const results: Array<{ userId: string; success: boolean; error?: string }> = [];
@@ -1897,82 +1977,95 @@ adminRouter.post('/bulk/restart', requireSuperAuth, async (c) => {
   });
 });
 
-// POST /api/super/users/:id/message - Direct message to container (admin bypass)
-// Allows admin to impersonate any user and send messages directly to their container
-// This bypasses Telegram/Discord pairing requirements
+// POST /api/super/users/:id/message - Send message to container via openclaw agent CLI
+// Connects to the gateway over WebSocket and runs an agent turn
 adminRouter.post('/users/:id/message', requireSuperAuth, async (c) => {
   const userId = c.req.param('id');
   const body = await c.req.json().catch(() => ({}));
-  const { text, asUserId, sessionKey } = body;
-  
-  if (!text || typeof text !== 'string') {
-    return c.json({ error: 'Message text is required' }, 400);
+  const { message, sessionKey } = body;
+
+  if (!message || typeof message !== 'string') {
+    return c.json({ error: 'message (string) is required' }, 400);
   }
-  
-  const impersonatedUserId = asUserId || 'admin';
-  const messageSessionKey = sessionKey || `admin-${Date.now()}`;
-  
+
+  const session = sessionKey || `admin-${Date.now()}`;
+
   return await withWake(c.env, userId, async () => {
     const sandbox = await getUserSandbox(c.env, userId, true);
-    
-    try {
-      // Create a message payload that mimics normal channel delivery
-      const messagePayload = {
-        id: `admin-${Date.now()}`,
-        sessionKey: messageSessionKey,
-        text: text,
-        from: {
-          id: impersonatedUserId,
-          name: 'Admin',
-          isAdmin: true,
-        },
-        timestamp: new Date().toISOString(),
-        channel: 'admin-direct',
-      };
-      
-      // Write to container's message inbox
-      const inboxPath = `/tmp/admin-messages/${messageSessionKey}.json`;
-      const inboxDir = '/tmp/admin-messages';
-      
-      // Ensure directory exists
-      try {
-        await sandbox.mkdir(inboxDir, { recursive: true });
-      } catch {
-        // Directory may already exist
-      }
-      
-      // Write message to inbox
-      await sandbox.writeFile(inboxPath, JSON.stringify(messagePayload, null, 2));
-      
-      // Trigger the gateway to process the message
-      // This simulates what happens when a real message arrives
-      const triggerProc = await sandbox.startProcess(
-        `cd /root/openclaw && echo '${JSON.stringify(messagePayload)}' | openclaw message --stdin --session "${messageSessionKey}" --from "${impersonatedUserId}" 2>&1 || echo "Message queued for processing"`
-      );
-      
-      await new Promise(r => setTimeout(r, 500));
-      const logs = await triggerProc.getLogs();
-      
-      return c.json({
-        success: true,
-        userId,
-        impersonatedAs: impersonatedUserId,
-        sessionKey: messageSessionKey,
-        message: text,
-        gatewayResponse: logs.stdout || 'Message delivered to container',
-        timestamp: messagePayload.timestamp,
-        note: 'Admin direct message bypasses normal channel authentication'
-      });
-      
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      return c.json({
-        error: 'Failed to deliver admin message',
-        details: errorMessage,
-        userId,
-        impersonatedAs: impersonatedUserId,
-      }, 500);
+
+    // Write message to temp file to avoid shell escaping issues
+    const tmpFile = `/tmp/admin-msg-${Date.now()}.txt`;
+    await sandbox.writeFile(tmpFile, message);
+
+    const cmd = [
+      'openclaw agent',
+      `--message "$(cat ${tmpFile})"`,
+      `--session-id "${session}"`,
+      '--json',
+      '--timeout 60',
+      `2>&1; rm -f ${tmpFile}`,
+    ].join(' ');
+
+    const proc = await sandbox.startProcess(cmd);
+
+    // Poll for completion (up to ~25s for Worker timeout safety)
+    const deadline = Date.now() + 25_000;
+    let output = '';
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 1000));
+      const logs = await proc.getLogs();
+      output = logs.stdout || '';
+      // Look for JSON output (openclaw agent --json outputs a JSON object)
+      if (output.includes('"status"')) break;
     }
+
+    // Strip deprecation warnings and other non-JSON preamble
+    const jsonStart = output.indexOf('{');
+    const jsonContent = jsonStart >= 0 ? output.slice(jsonStart) : '';
+
+    if (!jsonContent.trim()) {
+      return c.json({
+        status: 'pending',
+        userId,
+        sessionKey: session,
+        note: 'Message sent but response not yet available. Check session history.',
+        rawOutput: output || undefined,
+      }, 202);
+    }
+
+    try {
+      const parsed = JSON.parse(jsonContent);
+      // Extract the text reply from the agent response
+      const text = parsed.result?.payloads?.[0]?.text;
+      return c.json({
+        status: parsed.status === 'ok' ? 'complete' : parsed.status,
+        userId,
+        sessionKey: session,
+        reply: text || null,
+        response: parsed,
+      });
+    } catch {
+      return c.json({
+        status: 'complete',
+        userId,
+        sessionKey: session,
+        rawOutput: output,
+      });
+    }
+  });
+});
+
+// GET /api/super/users/:id/sessions - List agent sessions in container
+adminRouter.get('/users/:id/sessions', requireSuperAuth, async (c) => {
+  const userId = c.req.param('id');
+  return await withWake(c.env, userId, async () => {
+    const sandbox = await getUserSandbox(c.env, userId, true);
+    const proc = await sandbox.startProcess(
+      'ls -la /root/.openclaw/agents/main/sessions/ 2>/dev/null | tail -20'
+    );
+    await new Promise(r => setTimeout(r, 2000));
+    const logs = await proc.getLogs();
+    return c.json({ userId, sessions: logs.stdout || 'No sessions found' });
   });
 });
 

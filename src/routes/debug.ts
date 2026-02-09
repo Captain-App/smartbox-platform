@@ -989,42 +989,23 @@ debug.get('/sync-status', async (c) => {
       localSyncInfo.error = err instanceof Error ? err.message : 'Unknown error';
     }
 
-    // Read .last-sync from R2 mount (backup state)
+    // Read .last-sync from R2 API (backup state)
     let r2SyncInfo: { timestamp: string | null; error?: string } = { timestamp: null };
-    const r2Path = userId ? `/data/openclaw/users/${userId}/.last-sync` : '/data/openclaw/.last-sync';
     try {
-      const r2Proc = await sandbox.startProcess(`cat ${r2Path} 2>/dev/null || echo "NOT_FOUND"`);
-      await new Promise(r => setTimeout(r, 1000));
-      const r2Logs = await r2Proc.getLogs();
-      const content = (r2Logs.stdout || '').trim();
-      if (content && content !== 'NOT_FOUND') {
-        r2SyncInfo.timestamp = content;
+      const r2Prefix = userId ? `users/${userId}` : 'default';
+      const syncMarker = await c.env.MOLTBOT_BUCKET?.get(`${r2Prefix}/.last-sync`);
+      if (syncMarker) {
+        r2SyncInfo.timestamp = await syncMarker.text();
       }
     } catch (err) {
       r2SyncInfo.error = err instanceof Error ? err.message : 'Unknown error';
     }
 
-    // Check if R2 is mounted
-    let r2Mounted = false;
-    try {
-      const mountProc = await sandbox.startProcess('mountpoint -q /data/openclaw && echo "MOUNTED" || echo "NOT_MOUNTED"');
-      await new Promise(r => setTimeout(r, 500));
-      const mountLogs = await mountProc.getLogs();
-      r2Mounted = (mountLogs.stdout || '').includes('MOUNTED');
-    } catch {
-      // Ignore
-    }
+    // R2 is accessed via API, no FUSE mount needed
+    const r2Mounted = true; // Always "connected" via API
 
-    // Check if a sync is currently running
-    let syncRunning = false;
-    try {
-      const syncProc = await sandbox.startProcess('pgrep -f "rsync.*/root/.openclaw" >/dev/null && echo "RUNNING" || echo "NOT_RUNNING"');
-      await new Promise(r => setTimeout(r, 500));
-      const syncLogs = await syncProc.getLogs();
-      syncRunning = (syncLogs.stdout || '').includes('RUNNING');
-    } catch {
-      // Ignore
-    }
+    // No rsync processes — tar backup is atomic and short-lived
+    const syncRunning = false;
 
     // Check if openclaw.json exists locally
     let hasLocalConfig = false;
@@ -1451,15 +1432,8 @@ debug.get('/admin/users/:userId/sync-status', async (c) => {
         localSyncInfo.error = err instanceof Error ? err.message : 'Unknown error';
       }
 
-      // Check R2 mount
-      try {
-        const mountProc = await sandbox.startProcess('mountpoint -q /data/openclaw && echo "MOUNTED" || echo "NOT_MOUNTED"');
-        await new Promise(r => setTimeout(r, 500));
-        const mountLogs = await mountProc.getLogs();
-        r2Mounted = (mountLogs.stdout || '').includes('MOUNTED');
-      } catch {
-        // Ignore
-      }
+      // R2 accessed via API, no FUSE mount needed
+      r2Mounted = true;
 
       // Check local config
       try {
@@ -1471,15 +1445,8 @@ debug.get('/admin/users/:userId/sync-status', async (c) => {
         // Ignore
       }
 
-      // Check sync running
-      try {
-        const syncProc = await sandbox.startProcess('pgrep -f "rsync.*/root/.openclaw" >/dev/null && echo "RUNNING" || echo "NOT_RUNNING"');
-        await new Promise(r => setTimeout(r, 500));
-        const syncLogs = await syncProc.getLogs();
-        syncRunning = (syncLogs.stdout || '').includes('RUNNING');
-      } catch {
-        // Ignore
-      }
+      // No rsync processes — tar backup is atomic
+      syncRunning = false;
 
     } catch {
       // Container not available, that's okay
@@ -1605,16 +1572,20 @@ debug.get('/admin/users/:userId/env', async (c) => {
     await new Promise(r => setTimeout(r, 1000));
     const logs = await envProc.getLogs();
 
-    // Also check R2 mount
-    const r2Proc = await sandbox.startProcess('ls -la /data/openclaw/users/ 2>&1 | head -10');
-    await new Promise(r => setTimeout(r, 1000));
-    const r2Logs = await r2Proc.getLogs();
+    // Check R2 backup via API
+    let r2Status = 'unknown';
+    try {
+      const backupHead = await c.env.MOLTBOT_BUCKET?.head(`users/${userId}/backup.tar.gz`);
+      r2Status = backupHead ? `backup.tar.gz: ${backupHead.size} bytes, uploaded ${backupHead.uploaded?.toISOString()}` : 'no backup.tar.gz found';
+    } catch (e) {
+      r2Status = `R2 error: ${e instanceof Error ? e.message : 'Unknown'}`;
+    }
 
     return c.json({
       userId,
       sandboxName,
       envVars: (logs.stdout || '').split('\n').filter(Boolean),
-      r2Status: r2Logs.stdout || r2Logs.stderr || 'no output',
+      r2Status,
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';

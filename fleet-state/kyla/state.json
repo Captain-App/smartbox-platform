@@ -1,0 +1,27 @@
+{
+  "userId": "38b1ec2b-7a70-4834-a48d-162b8902b0fd",
+  "name": "kyla",
+  "tier": "standard-1",
+  "checkIns": [
+    {
+      "at": "2026-02-07T13:38:06Z",
+      "state": "idle",
+      "processes": 0,
+      "healthy": false
+    },
+    {
+      "at": "2026-02-08T12:48:00Z",
+      "state": "active",
+      "processes": 14,
+      "healthy": true
+    }
+  ],
+  "alerts": [],
+  "notes": "Personal productivity",
+  "lastCheckIn": {
+    "at": "2026-02-08T12:48:00Z",
+    "state": "active",
+    "processes": 14,
+    "healthy": true
+  }
+}

@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE="https://claw.captainapp.co.uk/api/super"
+TOKEN="bd2bc65905da06b1dbf4d266f6719997fdebf43727d7382cc9639d475dbf198e"
+
+# ── User map ──────────────────────────────────────────────────────────
+declare -A USERS=(
+  [jack]="32c7100e-c6ce-4cf8-8b64-edf4ac3b760b"
+  [josh]="81bf6a68-28fe-48ef-b257-f9ad013e6298"
+  [miles]="fe56406b-a723-43cf-9f19-ba2ffcb135b0"
+  [kyla]="38b1ec2b-7a70-4834-a48d-162b8902b0fd"
+  [rhys]="0f1195c1-6b57-4254-9871-6ef3b7fa360c"
+  [ben]="e29fd082-6811-4e29-893e-64699c49e1f0"
+  [david_g]="6d575ef4-7ac8-4a17-b732-e0e690986e58"
+  [adnan]="aef3677b-afdf-4a7e-bbeb-c596f0d94d29"
+  [david_l]="5bb7d208-2baf-4c95-8aec-f28e016acedb"
+  [joe]="f1647b02-c311-49c3-9c72-48b8fc5da350"
+)
+
+# ── Helpers ───────────────────────────────────────────────────────────
+resolve_user() {
+  local name="$1"
+  if [[ -n "${USERS[$name]+x}" ]]; then
+    echo "${USERS[$name]}"
+  else
+    echo "$name"  # assume raw UUID
+  fi
+}
+
+pretty() {
+  if command -v jq &>/dev/null; then
+    jq .
+  else
+    cat
+  fi
+}
+
+apicurl() {
+  curl -s -H "X-Admin-Secret: $TOKEN" "$@"
+}
+
+# ── Color helpers ─────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+colorize_status() {
+  # Colorize dashboard/status JSON output
+  if command -v jq &>/dev/null; then
+    jq -r '
+      if type == "array" then
+        .[] | "\(.name // .userId)\t\(.status // .state // "unknown")"
+      elif type == "object" and has("users") then
+        .users[] | "\(.name // .userId)\t\(.status // .state // "unknown")"
+      else
+        . | tostring
+      end
+    ' 2>/dev/null | while IFS=$'\t' read -r name status; do
+      case "$status" in
+        running|active|healthy)
+          printf "${GREEN}%-12s${RESET} %s\n" "$status" "$name" ;;
+        starting|restoring|initializing)
+          printf "${YELLOW}%-12s${RESET} %s\n" "$status" "$name" ;;
+        stopped|error|failed|unhealthy)
+          printf "${RED}%-12s${RESET} %s\n" "$status" "$name" ;;
+        *)
+          printf "${CYAN}%-12s${RESET} %s\n" "$status" "$name" ;;
+      esac
+    done
+    return 0
+  fi
+  return 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: claw <command> [args...]
+
+Commands:
+  status [user]            Container status (or all if no user)
+  dashboard                All containers overview
+  restart <user>           Restart container
+  logs <user> [tail=50]    View gateway logs
+  exec <user> <cmd...>     Execute command in container
+  config <user>            View config
+  config-set <user> <json> Patch config (deep merge)
+  message <user> <msg>     Send message to bot
+  sessions <user>          List agent sessions
+  r2 <user>                R2 backup status
+  files <user> [path]      List/read files
+  backup <user>            Trigger backup to R2
+  wake <user>              Wake sleeping container
+  bulk-restart [delay]     Restart all containers
+  users                    List all known users
+  cost                     Cost summary
+  cost-user <user>         Cost breakdown for user
+  help                     Show this help
+EOF
+  echo ""
+  echo "Users: $(echo "${!USERS[@]}" | tr ' ' '\n' | sort | tr '\n' ' ')"
+}
+
+# ── Commands ──────────────────────────────────────────────────────────
+cmd_status() {
+  if [[ $# -eq 0 ]]; then
+    apicurl "$BASE/state/dashboard" | pretty
+  else
+    local uid; uid=$(resolve_user "$1")
+    apicurl "$BASE/users/$uid/state/v2" | pretty
+  fi
+}
+
+cmd_dashboard() {
+  local raw
+  raw=$(apicurl "$BASE/state/dashboard")
+  if ! colorize_status <<<"$raw"; then
+    echo "$raw" | pretty
+  fi
+}
+
+cmd_restart() {
+  [[ $# -lt 1 ]] && { echo "Usage: claw restart <user>"; exit 1; }
+  local uid; uid=$(resolve_user "$1")
+  echo -e "${YELLOW}Restarting ${1}...${RESET}"
+  apicurl -X POST "$BASE/users/$uid/restart-async" | pretty
+}
+
+cmd_logs() {
+  [[ $# -lt 1 ]] && { echo "Usage: claw logs <user> [tail=50]"; exit 1; }
+  local uid; uid=$(resolve_user "$1")
+  local tail="${2:-50}"
+  apicurl "$BASE/users/$uid/logs?tail=$tail" | pretty
+}
+
+cmd_exec() {
+  [[ $# -lt 2 ]] && { echo "Usage: claw exec <user> <cmd...>"; exit 1; }
+  local uid; uid=$(resolve_user "$1"); shift
+  local cmd="$*"
+  apicurl -X POST "$BASE/users/$uid/exec" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --arg c "$cmd" '{command: $c}')" | pretty
+}
+
+cmd_config() {
+  [[ $# -lt 1 ]] && { echo "Usage: claw config <user>"; exit 1; }
+  local uid; uid=$(resolve_user "$1")
+  apicurl "$BASE/users/$uid/config" | pretty
+}
+
+cmd_config_set() {
+  [[ $# -lt 2 ]] && { echo "Usage: claw config-set <user> <json>"; exit 1; }
+  local uid; uid=$(resolve_user "$1"); shift
+  local json="$*"
+  apicurl -X PATCH "$BASE/users/$uid/config" \
+    -H "Content-Type: application/json" \
+    -d "$json" | pretty
+}
+
+cmd_message() {
+  [[ $# -lt 2 ]] && { echo "Usage: claw message <user> <msg>"; exit 1; }
+  local uid; uid=$(resolve_user "$1"); shift
+  local msg="$*"
+  apicurl -X POST "$BASE/users/$uid/message" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --arg m "$msg" '{message: $m}')" | pretty
+}
+
+cmd_sessions() {
+  [[ $# -lt 1 ]] && { echo "Usage: claw sessions <user>"; exit 1; }
+  local uid; uid=$(resolve_user "$1")
+  apicurl "$BASE/users/$uid/sessions" | pretty
+}
+
+cmd_r2() {
+  [[ $# -lt 1 ]] && { echo "Usage: claw r2 <user>"; exit 1; }
+  local uid; uid=$(resolve_user "$1")
+  apicurl "$BASE/users/$uid/r2-status" | pretty
+}
+
+cmd_files() {
+  [[ $# -lt 1 ]] && { echo "Usage: claw files <user> [path]"; exit 1; }
+  local uid; uid=$(resolve_user "$1")
+  local path="${2:-}"
+  if [[ -n "$path" ]]; then
+    apicurl "$BASE/users/$uid/files/$path" | pretty
+  else
+    apicurl "$BASE/users/$uid/files" | pretty
+  fi
+}
+
+cmd_backup() {
+  [[ $# -lt 1 ]] && { echo "Usage: claw backup <user>"; exit 1; }
+  local uid; uid=$(resolve_user "$1")
+  echo -e "${YELLOW}Triggering backup for ${1}...${RESET}"
+  apicurl -X POST "$BASE/users/$uid/sync-async" | pretty
+}
+
+cmd_wake() {
+  [[ $# -lt 1 ]] && { echo "Usage: claw wake <user>"; exit 1; }
+  local uid; uid=$(resolve_user "$1")
+  apicurl -X POST "$BASE/users/$uid/wake" | pretty
+}
+
+cmd_bulk_restart() {
+  local delay="${1:-5}"
+  echo -e "${YELLOW}Bulk restarting all containers (delay=${delay}s)...${RESET}"
+  apicurl -X POST "$BASE/bulk/restart" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --argjson d "$delay" '{delay: $d}')" | pretty
+}
+
+cmd_users() {
+  printf "${BOLD}%-12s %s${RESET}\n" "NAME" "UUID"
+  for name in $(echo "${!USERS[@]}" | tr ' ' '\n' | sort); do
+    printf "%-12s %s\n" "$name" "${USERS[$name]}"
+  done
+}
+
+cmd_cost() {
+  apicurl "$BASE/cost" | pretty
+}
+
+cmd_cost_user() {
+  [[ $# -lt 1 ]] && { echo "Usage: claw cost-user <user>"; exit 1; }
+  local uid; uid=$(resolve_user "$1")
+  apicurl "$BASE/cost/users/$uid" | pretty
+}
+
+# ── Main dispatch ─────────────────────────────────────────────────────
+[[ $# -eq 0 ]] && { usage; exit 0; }
+
+cmd="$1"; shift
+case "$cmd" in
+  status)        cmd_status "$@" ;;
+  dashboard|dash) cmd_dashboard "$@" ;;
+  restart)       cmd_restart "$@" ;;
+  logs)          cmd_logs "$@" ;;
+  exec)          cmd_exec "$@" ;;
+  config)        cmd_config "$@" ;;
+  config-set)    cmd_config_set "$@" ;;
+  message|msg)   cmd_message "$@" ;;
+  sessions)      cmd_sessions "$@" ;;
+  r2)            cmd_r2 "$@" ;;
+  files)         cmd_files "$@" ;;
+  backup|sync)   cmd_backup "$@" ;;
+  wake)          cmd_wake "$@" ;;
+  bulk-restart)  cmd_bulk_restart "$@" ;;
+  users)         cmd_users "$@" ;;
+  cost)          cmd_cost "$@" ;;
+  cost-user)     cmd_cost_user "$@" ;;
+  help|-h|--help) usage ;;
+  *)             echo "Unknown command: $cmd"; usage; exit 1 ;;
+esac

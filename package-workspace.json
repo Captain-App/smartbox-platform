@@ -1,0 +1,31 @@
+{
+  "name": "moltworker-monorepo",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "Moltworker architecture - multi-worker setup with Edge Router, Admin API, and Container Gateway",
+  "workspaces": [
+    "packages/*",
+    "workers/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "typecheck": "npm run typecheck --workspaces",
+    "deploy:shared": "cd packages/shared && npm run typecheck",
+    "deploy:admin-api": "cd workers/admin-api && wrangler deploy",
+    "deploy:container-gateway": "cd workers/container-gateway && wrangler deploy",
+    "deploy:router": "cd workers/router && wrangler deploy",
+    "deploy:all": "npm run deploy:admin-api && npm run deploy:container-gateway && npm run deploy:router",
+    "dev:admin-api": "cd workers/admin-api && wrangler dev",
+    "dev:container-gateway": "cd workers/container-gateway && wrangler dev",
+    "dev:router": "cd workers/router && wrangler dev",
+    "migration:enable-new": "node scripts/enable-new-architecture.mjs",
+    "migration:rollback": "node scripts/rollback-architecture.mjs",
+    "test:admin-api": "curl -s -H 'X-Admin-Secret: test' http://localhost:8787/api/super/users",
+    "test:router": "curl -s http://localhost:8787/health"
+  },
+  "devDependencies": {
+    "wrangler": "^4.50.0",
+    "typescript": "^5.9.3"
+  }
+}

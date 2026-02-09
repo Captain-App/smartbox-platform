@@ -1,16 +1,12 @@
 #!/bin/bash
 # Startup script for Moltbot in Cloudflare Sandbox
-# v5: Removed tee logging to avoid subprocess issues in sandbox
-# This script:
-# 1. Restores config from R2 backup if available
-# 2. Configures moltbot from environment variables
-# 3. Starts the gateway
+# v7: Container self-restore via presigned R2 URL
+#
+# The Worker generates a time-limited, user-scoped presigned URL.
+# This script downloads the backup directly from R2 and extracts it.
+# No base64 piping, no Worker middleman, no 15s timeout races.
 
 set -e
-
-# NOTE: Removed tee-based logging (lines 14-15) because process substitution
-# creates subprocesses that get killed when the sandbox times out, causing
-# the startup script to fail. Stdout/stderr are captured by the sandbox anyway.
 
 STARTUP_LOCK="/tmp/moltbot-startup.lock"
 
@@ -31,34 +27,35 @@ if pgrep -f "openclaw gateway" > /dev/null 2>&1; then
     exit 0
 fi
 
-# ZOMBIE KILLER: Aggressively clean up any stale gateway processes
-# This prevents the "port 18789 already in use" crash loop
-echo "Checking for zombie processes..."
+# ============================================================
+# SELF-RESTORE FROM R2 (via presigned URL)
+# ============================================================
+# The Worker passes RESTORE_URL — a presigned S3 URL scoped to this
+# user's backup.tar.gz. It expires in 5 minutes and cannot access
+# any other user's data.
+if [ -n "$RESTORE_URL" ]; then
+    echo "Restoring data from R2 (presigned URL)..."
+    RESTORE_START=$(date +%s%N)
 
-# Kill any openclaw processes (graceful then force)
-pkill -f "openclaw gateway" 2>/dev/null || true
-sleep 1
-pkill -9 -f "openclaw" 2>/dev/null || true
+    # Download and extract in one pipe — no temp files, no base64
+    # curl -sf: silent + fail on HTTP errors
+    # tar xzf: extract gzipped tar to root
+    if curl -sf "$RESTORE_URL" | tar xzf - -C / 2>/dev/null; then
+        RESTORE_END=$(date +%s%N)
+        RESTORE_MS=$(( (RESTORE_END - RESTORE_START) / 1000000 ))
+        echo "Restore complete in ${RESTORE_MS}ms"
 
-# Kill anything on port 18789
-fuser -k 18789/tcp 2>/dev/null || true
+        # Write cooldown marker (prevent backup overwriting fresh restore)
+        mkdir -p /root/.openclaw
+        date +%s > /root/.openclaw/.restore-time
+    else
+        echo "WARNING: Restore failed or no backup exists — starting fresh"
+    fi
 
-# Clear all lock files (except our startup lock)
-rm -f /tmp/openclaw*.lock /root/.openclaw/*.lock /tmp/openclaw-gateway.lock 2>/dev/null || true
-
-# Wait for cleanup
-sleep 2
-
-# Apply CaptainApp provider patch
-if [ -f /usr/local/lib/node_modules/openclaw-captainapp-patch.js ]; then
-    echo "Applying CaptainApp provider patch..."
-    node /usr/local/lib/node_modules/openclaw-captainapp-patch.js || echo "Patch may already be applied"
-fi
-
-# Double-check no gateway started while we were cleaning up
-if pgrep -f "openclaw gateway" > /dev/null 2>&1; then
-    echo "Gateway started during cleanup, exiting."
-    exit 0
+    # Clear the URL from env (single-use, about to expire anyway)
+    unset RESTORE_URL
+else
+    echo "No RESTORE_URL — Worker-side restore was used (or no backup exists)"
 fi
 
 # Paths
@@ -66,248 +63,20 @@ CONFIG_DIR="/root/.openclaw"
 CONFIG_FILE="$CONFIG_DIR/openclaw.json"
 TEMPLATE_DIR="/root/.openclaw-templates"
 TEMPLATE_FILE="$TEMPLATE_DIR/moltbot.json.template"
-# Base R2 mount path - user data is in subdirectories
-R2_MOUNT="/data/openclaw"
-
-# Determine user-specific backup directory
-if [ -n "$OPENCLAW_USER_ID" ]; then
-    BACKUP_DIR="$R2_MOUNT/users/$OPENCLAW_USER_ID"
-    echo "User ID: $OPENCLAW_USER_ID"
-else
-    # Fallback for legacy single-user mode
-    BACKUP_DIR="$R2_MOUNT"
-fi
 
 echo "Config directory: $CONFIG_DIR"
-echo "Backup directory: $BACKUP_DIR"
-
-# Wait for R2 mount to be available (async mount can take time)
-echo "Waiting for R2 mount..."
-R2_WAIT=0
-MAX_WAIT=30  # If mount takes > 30s, something is wrong
-while [ ! -d "$R2_MOUNT" ] && [ $R2_WAIT -lt $MAX_WAIT ]; do
-    sleep 1
-    R2_WAIT=$((R2_WAIT + 1))
-    if [ $((R2_WAIT % 10)) -eq 0 ]; then
-        echo "Waiting for R2... ($R2_WAIT/$MAX_WAIT)"
-        # Check if mount process exists
-        if ! pgrep -f "s3fs" > /dev/null; then
-            echo "WARNING: s3fs process not found - mount may have failed"
-        fi
-    fi
-done
-
-if [ -d "$R2_MOUNT" ]; then
-    echo "R2 mounted at $R2_MOUNT after ${R2_WAIT}s"
-    ls -la "$R2_MOUNT" | head -5
-else
-    echo "ERROR: R2 mount failed after ${MAX_WAIT}s"
-    echo "Checking mount table:"
-    mount | grep s3fs || echo "No s3fs mounts found"
-    echo "Continuing without R2 backup - container will use local storage only"
-fi
 
 # Create config directory
 mkdir -p "$CONFIG_DIR"
 
-# ============================================================
-# RESTORE FROM R2 BACKUP
-# ============================================================
-# Check if R2 backup exists by looking for openclaw.json (or legacy clawdbot.json)
-# The BACKUP_DIR may exist but be empty if R2 was just mounted
-# Note: backup structure is $BACKUP_DIR/openclaw/ (or legacy $BACKUP_DIR/clawdbot/) and $BACKUP_DIR/skills/
-
-# Helper function to parse ISO timestamp to epoch seconds (POSIX-compatible)
-# Handles formats: "syncId|2024-01-15T10:30:00Z" or "2024-01-15T10:30:00+00:00"
-parse_timestamp_to_epoch() {
-    local input="$1"
-
-    # If input contains |, extract the timestamp part (new format: syncId|timestamp)
-    if echo "$input" | grep -q '|'; then
-        input=$(echo "$input" | cut -d'|' -f2)
-    fi
-
-    # Try GNU date first (Linux)
-    local epoch=$(date -d "$input" +%s 2>/dev/null)
-    if [ -n "$epoch" ] && [ "$epoch" != "0" ]; then
-        echo "$epoch"
-        return 0
-    fi
-
-    # Try BSD date (macOS) - requires different format
-    # Convert ISO format to BSD-compatible format
-    local bsd_date=$(echo "$input" | sed 's/T/ /; s/\+00:00//; s/Z//')
-    epoch=$(date -j -f "%Y-%m-%d %H:%M:%S" "$bsd_date" +%s 2>/dev/null)
-    if [ -n "$epoch" ] && [ "$epoch" != "0" ]; then
-        echo "$epoch"
-        return 0
-    fi
-
-    # Fallback: extract just the date part and use simple comparison
-    # Extract YYYYMMDDHHMMSS for numeric comparison
-    local simple=$(echo "$input" | sed 's/[^0-9]//g' | cut -c1-14)
-    if [ -n "$simple" ]; then
-        echo "$simple"
-        return 0
-    fi
-
-    echo "0"
-    return 1
-}
-
-# Helper function to check if R2 backup is newer than local
-# IMPORTANT: Also forces restore if local config is missing or suspiciously small
-should_restore_from_r2() {
-    local R2_SYNC_FILE="$BACKUP_DIR/.last-sync"
-    local LOCAL_SYNC_FILE="$CONFIG_DIR/.last-sync"
-    local LOCAL_CONFIG="$CONFIG_DIR/openclaw.json"
-
-    # If no R2 sync timestamp, don't restore (nothing to restore from)
-    if [ ! -f "$R2_SYNC_FILE" ]; then
-        echo "No R2 sync timestamp found, skipping restore"
-        return 1
-    fi
-
-    # CRITICAL: Always restore if no local config exists
-    if [ ! -f "$LOCAL_CONFIG" ]; then
-        echo "No local config file, will restore from R2"
-        return 0
-    fi
-
-    # CRITICAL: Always restore if local config is suspiciously small (likely empty/corrupted)
-    # A valid config should be at least 100 bytes (minimal JSON structure)
-    local CONFIG_SIZE=0
-    if [ -f "$LOCAL_CONFIG" ]; then
-        # Use stat with fallbacks for different systems
-        CONFIG_SIZE=$(stat -c%s "$LOCAL_CONFIG" 2>/dev/null || stat -f%z "$LOCAL_CONFIG" 2>/dev/null || echo "0")
-    fi
-    if [ "$CONFIG_SIZE" -lt 100 ]; then
-        echo "Local config too small ($CONFIG_SIZE bytes), will restore from R2"
-        return 0
-    fi
-
-    # If no local sync timestamp, restore from R2
-    if [ ! -f "$LOCAL_SYNC_FILE" ]; then
-        echo "No local sync timestamp, will restore from R2"
-        return 0
-    fi
-
-    # Read timestamps
-    R2_TIME=$(cat "$R2_SYNC_FILE" 2>/dev/null)
-    LOCAL_TIME=$(cat "$LOCAL_SYNC_FILE" 2>/dev/null)
-
-    echo "R2 last sync: $R2_TIME"
-    echo "Local last sync: $LOCAL_TIME"
-
-    # Convert to epoch seconds for comparison using portable function
-    R2_EPOCH=$(parse_timestamp_to_epoch "$R2_TIME")
-    LOCAL_EPOCH=$(parse_timestamp_to_epoch "$LOCAL_TIME")
-
-    echo "R2 epoch: $R2_EPOCH, Local epoch: $LOCAL_EPOCH"
-
-    if [ "$R2_EPOCH" -gt "$LOCAL_EPOCH" ]; then
-        echo "R2 backup is newer, will restore"
-        return 0
-    else
-        echo "Local data is newer or same, skipping restore"
-        return 1
-    fi
-}
-
-# Check if we should restore from R2 ONCE before modifying any local state
-SHOULD_RESTORE=false
-if should_restore_from_r2; then
-    SHOULD_RESTORE=true
+# Ensure openclaw docs/templates symlink exists in /workspace/ (sandbox CWD)
+# openclaw resolves templates relative to CWD
+if [ ! -L "/workspace/docs" ] && [ ! -d "/workspace/docs" ]; then
+    mkdir -p /workspace
+    ln -sfn /usr/local/lib/node_modules/@captain-app/openclaw/docs /workspace/docs 2>/dev/null || true
 fi
 
-# ============================================================
-# MIGRATION: clawdbot -> openclaw
-# ============================================================
-# If user has legacy clawdbot data but no openclaw data, migrate automatically
-if [ -d "$BACKUP_DIR/clawdbot" ] && [ ! -d "$BACKUP_DIR/openclaw" ]; then
-    echo "=== MIGRATION: Copying clawdbot data to openclaw ==="
-    cp -a "$BACKUP_DIR/clawdbot" "$BACKUP_DIR/openclaw"
-    # Rename clawdbot.json to openclaw.json if it exists
-    if [ -f "$BACKUP_DIR/openclaw/clawdbot.json" ]; then
-        mv "$BACKUP_DIR/openclaw/clawdbot.json" "$BACKUP_DIR/openclaw/openclaw.json"
-        echo "Renamed clawdbot.json to openclaw.json"
-    fi
-    # Update .last-sync to force restore
-    echo "migration-$(date -Iseconds)" > "$BACKUP_DIR/.last-sync"
-    echo "Migration complete - will restore from openclaw directory"
-    SHOULD_RESTORE=true
-fi
-
-# DEBUG: Show what's in R2 before restore
-echo "=== DEBUG: Checking R2 contents ==="
-echo "BACKUP_DIR contents:"
-ls -la "$BACKUP_DIR/" 2>/dev/null | head -20 || echo "Cannot list BACKUP_DIR"
-echo ""
-echo "Looking for openclaw directory:"
-ls -la "$BACKUP_DIR/openclaw/" 2>/dev/null | head -10 || echo "No openclaw dir"
-echo ""
-echo "Looking for clawdbot directory:"
-ls -la "$BACKUP_DIR/clawdbot/" 2>/dev/null | head -10 || echo "No clawdbot dir"
-echo "=== END DEBUG ==="
-
-# Restore config from R2 backup
-if [ -f "$BACKUP_DIR/openclaw/openclaw.json" ]; then
-    if [ "$SHOULD_RESTORE" = true ]; then
-        echo "Restoring from R2 backup at $BACKUP_DIR/openclaw..."
-        cp -a "$BACKUP_DIR/openclaw/." "$CONFIG_DIR/"
-        echo "Restored config from R2 backup"
-    else
-        echo "openclaw.json exists but SHOULD_RESTORE=false"
-    fi
-elif [ -f "$BACKUP_DIR/clawdbot/clawdbot.json" ]; then
-    # Legacy backup format (clawdbot naming)
-    if [ "$SHOULD_RESTORE" = true ]; then
-        echo "Restoring from legacy R2 backup at $BACKUP_DIR/clawdbot..."
-        cp -a "$BACKUP_DIR/clawdbot/." "$CONFIG_DIR/"
-        echo "Restored config from legacy R2 backup"
-    else
-        echo "clawdbot.json exists but SHOULD_RESTORE=false"
-    fi
-elif [ -f "$BACKUP_DIR/clawdbot.json" ]; then
-    # Legacy backup format (flat structure)
-    if [ "$SHOULD_RESTORE" = true ]; then
-        echo "Restoring from legacy flat R2 backup at $BACKUP_DIR..."
-        cp -a "$BACKUP_DIR/." "$CONFIG_DIR/"
-        echo "Restored config from legacy flat R2 backup"
-    fi
-elif [ -d "$BACKUP_DIR" ]; then
-    echo "R2 mounted at $BACKUP_DIR but no backup data found yet"
-else
-    echo "R2 not mounted, starting fresh"
-fi
-
-# Restore workspace from R2 backup if available
-# This includes scripts, skills, and any other user files in /root/clawd/
-WORKSPACE_DIR="/root/openclaw"
-if [ -d "$BACKUP_DIR/workspace" ] && [ "$(ls -A $BACKUP_DIR/workspace 2>/dev/null)" ]; then
-    if [ "$SHOULD_RESTORE" = true ]; then
-        echo "Restoring workspace from $BACKUP_DIR/workspace..."
-        mkdir -p "$WORKSPACE_DIR"
-        cp -a "$BACKUP_DIR/workspace/." "$WORKSPACE_DIR/"
-        echo "Restored workspace from R2 backup"
-    fi
-elif [ -d "$BACKUP_DIR/skills" ] && [ "$(ls -A $BACKUP_DIR/skills 2>/dev/null)" ]; then
-    # Legacy fallback: restore just skills if no workspace backup exists
-    if [ "$SHOULD_RESTORE" = true ]; then
-        echo "Restoring skills from legacy $BACKUP_DIR/skills..."
-        mkdir -p "$WORKSPACE_DIR/skills"
-        cp -a "$BACKUP_DIR/skills/." "$WORKSPACE_DIR/skills/"
-        echo "Restored skills from legacy R2 backup"
-    fi
-fi
-
-# Copy sync timestamp AFTER all restores complete
-if [ "$SHOULD_RESTORE" = true ]; then
-    cp -f "$BACKUP_DIR/.last-sync" "$CONFIG_DIR/.last-sync" 2>/dev/null || true
-    echo "Marked local state as synced with R2"
-fi
-
-# If config file still doesn't exist, create from template
+# If config file doesn't exist, create from template
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "No existing config found, initializing from template..."
     if [ -f "$TEMPLATE_FILE" ]; then
@@ -467,64 +236,15 @@ console.log('Auth profile written to', authPath);
 fi
 
 # ============================================================
-# SHUTDOWN HANDLER (Zero-Data-Loss Protection)
+# SHUTDOWN HANDLER
 # ============================================================
-# This ensures data is synced to R2 before container shutdown
-
-SHUTDOWN_IN_PROGRESS=false
-SHUTDOWN_SYNC_COMPLETE=false
+# The Worker handles backup to R2 via tar-backup.ts before container restart.
+# This handler just gives the gateway a moment to finish in-flight requests.
 
 shutdown_handler() {
-    if [ "$SHUTDOWN_IN_PROGRESS" = true ]; then
-        echo "[shutdown] Shutdown already in progress, waiting..."
-        return
-    fi
-    
-    SHUTDOWN_IN_PROGRESS=true
-    echo "[shutdown] Received shutdown signal, initiating emergency sync..."
-    echo "[shutdown] Signal received at $(date -Iseconds)"
-    
-    # Give the gateway a moment to finish any in-flight requests
+    echo "[shutdown] Received shutdown signal at $(date -Iseconds)"
     sleep 2
-    
-    # Sync critical files to R2 if R2 is mounted
-    if [ -d "$R2_MOUNT" ] && [ -d "$BACKUP_DIR" ]; then
-        echo "[shutdown] Syncing critical files to R2..."
-        
-        # Sync credentials directory
-        if [ -d "$CONFIG_DIR/credentials" ]; then
-            echo "[shutdown] Syncing credentials..."
-            rsync -r --no-times --delete "$CONFIG_DIR/credentials/" "$BACKUP_DIR/openclaw/credentials/" 2>/dev/null || true
-        fi
-        
-        # Sync main config file
-        if [ -f "$CONFIG_FILE" ]; then
-            echo "[shutdown] Syncing openclaw.json..."
-            rsync -r --no-times --delete "$CONFIG_FILE" "$BACKUP_DIR/openclaw/openclaw.json" 2>/dev/null || true
-        fi
-        
-        # Sync .registered marker
-        if [ -f "$CONFIG_DIR/.registered" ]; then
-            echo "[shutdown] Syncing .registered marker..."
-            rsync -r --no-times --delete "$CONFIG_DIR/.registered" "$BACKUP_DIR/openclaw/.registered" 2>/dev/null || true
-        fi
-        
-        # Update sync timestamp
-        echo "shutdown-$(date -Iseconds)" > "$BACKUP_DIR/.last-sync-shutdown"
-        cp -f "$BACKUP_DIR/.last-sync-shutdown" "$CONFIG_DIR/.last-sync" 2>/dev/null || true
-        
-        echo "[shutdown] Critical files synced successfully"
-        SHUTDOWN_SYNC_COMPLETE=true
-    else
-        echo "[shutdown] R2 not available, skipping sync"
-    fi
-    
-    # Signal completion
-    touch /tmp/shutdown-sync-complete 2>/dev/null || true
-    echo "[shutdown] Shutdown sync complete at $(date -Iseconds)"
-    
-    # Allow time for sync to complete before exiting
-    sleep 1
+    exit 0
 }
 
 # Register signal handlers
@@ -533,7 +253,6 @@ trap shutdown_handler SIGTERM SIGINT
 # ============================================================
 # START GATEWAY
 # ============================================================
-# Note: R2 backup sync is handled by the Worker's cron trigger
 echo "Starting Moltbot Gateway..."
 echo "Gateway will be available on port 18789"
 

@@ -1,0 +1,22 @@
+{
+  "name": "@moltworker/shared",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Shared types and utilities for moltworker architecture",
+  "exports": {
+    "./types": "./src/types.ts",
+    "./auth": "./src/auth.ts",
+    "./utils": "./src/utils.ts",
+    "./constants": "./src/constants.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "jose": "^6.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "typescript": "^5.9.3"
+  }
+}

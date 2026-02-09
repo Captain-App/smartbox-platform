@@ -1,0 +1,35 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "moltworker-router",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-05-06",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true
+  },
+  "preview_urls": false,
+  "workers_dev": false,
+  
+  "services": [
+    {
+      "binding": "ADMIN_API",
+      "service": "moltbot-sandbox"
+    },
+    {
+      "binding": "CONTAINER_GATEWAY",
+      "service": "moltbot-sandbox"
+    }
+  ],
+  
+  "routes": [
+    {
+      "pattern": "claw.captainapp.co.uk/*",
+      "zone_name": "captainapp.co.uk"
+    }
+  ],
+  
+  "vars": {
+    "USE_NEW_ADMIN_API": "true",
+    "USE_NEW_CONTAINER_GATEWAY": "false"
+  }
+}

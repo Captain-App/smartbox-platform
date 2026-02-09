@@ -1,0 +1,21 @@
+{
+  "name": "@moltworker/container-gateway",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Container Gateway Worker for per-user container proxy and websockets",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@moltworker/shared": "file:../../packages/shared",
+    "hono": "^4.11.6"
+  },
+  "devDependencies": {
+    "@cloudflare/sandbox": "*",
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.50.0"
+  }
+}

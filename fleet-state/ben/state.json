@@ -1,0 +1,27 @@
+{
+  "userId": "e29fd082-6811-4e29-893e-64699c49e1f0",
+  "name": "ben",
+  "tier": "standard-1",
+  "checkIns": [
+    {
+      "at": "2026-02-07T13:38:06Z",
+      "state": "idle",
+      "processes": 0,
+      "healthy": false
+    },
+    {
+      "at": "2026-02-08T12:48:00Z",
+      "state": "active",
+      "processes": 6,
+      "healthy": true
+    }
+  ],
+  "alerts": [],
+  "notes": "Personal productivity",
+  "lastCheckIn": {
+    "at": "2026-02-08T12:48:00Z",
+    "state": "active",
+    "processes": 6,
+    "healthy": true
+  }
+}

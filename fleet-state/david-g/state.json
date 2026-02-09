@@ -1,0 +1,27 @@
+{
+  "userId": "6d575ef4-7ac8-4a17-b732-e0e690986e58",
+  "name": "david-g",
+  "tier": "standard-1",
+  "checkIns": [
+    {
+      "at": "2026-02-07T13:38:06Z",
+      "state": "idle",
+      "processes": 0,
+      "healthy": false
+    },
+    {
+      "at": "2026-02-08T12:48:00Z",
+      "state": "active",
+      "processes": 13,
+      "healthy": true
+    }
+  ],
+  "alerts": [],
+  "notes": "Document processing",
+  "lastCheckIn": {
+    "at": "2026-02-08T12:48:00Z",
+    "state": "active",
+    "processes": 13,
+    "healthy": true
+  }
+}

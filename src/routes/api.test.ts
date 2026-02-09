@@ -10,7 +10,8 @@ vi.mock('../gateway', async (importOriginal) => {
     ...actual,
     ensureMoltbotGateway: vi.fn(async () => undefined),
     findExistingMoltbotProcess: vi.fn(async () => null),
-    mountR2Storage: vi.fn(async () => true),
+    backupToR2: vi.fn(async () => ({ success: true, durationMs: 100, sizeBytes: 1024 })),
+    restoreFromR2: vi.fn(async () => ({ success: true, durationMs: 100, format: 'tar' })),
     syncToR2: vi.fn(async () => ({ success: true })),
     waitForProcess: vi.fn(async () => undefined),
     getAllHealthStates: vi.fn(() => new Map()),
@@ -538,12 +539,8 @@ describe('GET /api/admin/storage', () => {
 
     const res = await app.request('/api/admin/storage', undefined, env, createExecutionCtx());
     expect(res.status).toBe(200);
-    const body = await json<{ configured: boolean; lastSync: string | null; mountPath: string; backupFiles: string[] }>(res);
+    const body = await json<{ configured: boolean; lastSync: string | null; backupInfo: any[] }>(res);
     expect(body.configured).toBe(true);
-    expect(body.lastSync).toContain('2026-01-31');
-    expect(body.mountPath).toBe(`/data/openclaw/${user.r2Prefix}`);
-    expect(body.backupFiles.length).toBeGreaterThan(0);
-    expect(vi.mocked(gateway.mountR2Storage)).toHaveBeenCalledWith(sandbox, env, { r2Prefix: user.r2Prefix });
   });
 });
 

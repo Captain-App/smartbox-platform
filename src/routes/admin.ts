@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
-import { getGatewayMasterToken } from '../gateway';
-import { getActiveUserIds, getUserNames, getUserRegistry, findUserByName } from '../lib/user-registry';
+import { getGatewayMasterToken, getAllContainerStats, getContainerStats, getFleetResourceSummary, collectAllContainerStats } from '../gateway';
+import { getActiveUserIds, getUserNames, getUserRegistry, findUserByName, getSandboxName } from '../lib/user-registry';
 
 /**
  * Admin API routes for managing user containers
@@ -29,7 +29,7 @@ async function requireSuperAuth(c: any, next: () => Promise<void>) {
 async function getUserSandbox(env: any, userId: string, keepAlive = false) {
   const { getSandbox } = await import('@cloudflare/sandbox');
   const { getSandboxForUser } = await import('../gateway/tiers');
-  const sandboxName = `openclaw-${userId}`;
+  const sandboxName = getSandboxName(userId);
 
   // Use tiered routing for migrated users, legacy for others
   const sandboxBinding = getSandboxForUser(env, userId);
@@ -184,6 +184,14 @@ adminRouter.get('/users', requireSuperAuth, async (c) => {
   });
 });
 
+// Resource Monitoring Endpoints
+adminRouter.get('/resources', requireSuperAuth, async (c) => {
+  return c.json({
+    message: 'Resource monitoring works!',
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // GET /api/super/users/lookup/:name - Look up user by name
 adminRouter.get('/users/lookup/:name', requireSuperAuth, async (c) => {
   const name = c.req.param('name');
@@ -192,6 +200,221 @@ adminRouter.get('/users/lookup/:name', requireSuperAuth, async (c) => {
     return c.json({ error: `No user found matching "${name}"` }, 404);
   }
   return c.json(user);
+});
+
+// =============================================================================
+// Debug/Inspect Endpoints (moved from public.ts, now auth-protected)
+// =============================================================================
+
+// GET /api/super/users/:userId/inspect - Inspect any user's sandbox
+adminRouter.get('/users/:userId/inspect', requireSuperAuth, async (c) => {
+  const userId = c.req.param('userId');
+  const sandboxName = `openclaw-${userId}`;
+
+  try {
+    const sandbox = await getUserSandbox(c.env, userId, false);
+
+    // Get processes
+    const processes = await sandbox.listProcesses();
+    const processData = await Promise.all(processes.map(async (p: any) => {
+      const data: Record<string, unknown> = {
+        id: p.id,
+        command: p.command,
+        status: p.status,
+        startTime: p.startTime?.toISOString(),
+        exitCode: p.exitCode,
+      };
+
+      // Get logs for gateway process
+      if (p.command.includes('start-moltbot') || p.status === 'failed') {
+        try {
+          const logs = await p.getLogs();
+          data.stdout = (logs.stdout || '').slice(-3000);
+          data.stderr = (logs.stderr || '').slice(-3000);
+        } catch {
+          data.logs_error = 'Failed to get logs';
+        }
+      }
+
+      return data;
+    }));
+
+    // Check R2 backup status
+    let r2Status: any = { hasBackup: false };
+    try {
+      const listed = await c.env.SMARTBOX_BUCKET.list({ prefix: `users/${userId}/` });
+      const files = listed.objects.map((o: any) => o.key.replace(`users/${userId}/`, ''));
+      r2Status = {
+        hasBackup: files.length > 0,
+        fileCount: files.length,
+        files: files.slice(0, 20),
+      };
+
+      // Check last sync
+      const syncMarker = await c.env.SMARTBOX_BUCKET.get(`users/${userId}/.last-sync`);
+      if (syncMarker) {
+        r2Status.lastSync = await syncMarker.text();
+      }
+
+      // Check config/personality
+      const configFile = await c.env.SMARTBOX_BUCKET.get(`users/${userId}/openclaw/config.json`);
+      if (configFile) {
+        try {
+          const config = JSON.parse(await configFile.text());
+          r2Status.personality = {
+            name: config.name,
+            personalityPreview: config.personality?.slice(0, 200),
+            model: config.model,
+          };
+        } catch { /* ignore */ }
+      }
+
+      // Check secrets
+      const secretsFile = await c.env.SMARTBOX_BUCKET.get(`users/${userId}/secrets.json`);
+      if (secretsFile) {
+        try {
+          const secrets = JSON.parse(await secretsFile.text());
+          r2Status.configuredSecrets = Object.keys(secrets).filter((k: string) => !!secrets[k]);
+        } catch { /* ignore */ }
+      }
+    } catch (e) {
+      r2Status.error = e instanceof Error ? e.message : 'Unknown error';
+    }
+
+    return c.json({
+      userId,
+      sandboxName,
+      processCount: processes.length,
+      processes: processData,
+      r2: r2Status,
+    });
+  } catch (error) {
+    return c.json({
+      error: error instanceof Error ? error.message : 'Unknown error',
+      userId,
+      sandboxName,
+    }, 500);
+  }
+});
+
+// GET /api/super/users/:userId/check-files - Check file system in user's container
+adminRouter.get('/users/:userId/check-files', requireSuperAuth, async (c) => {
+  const userId = c.req.param('userId');
+  const sandboxName = `openclaw-${userId}`;
+  const doSync = c.req.query('sync') === '1';
+
+  try {
+    const sandbox = await getUserSandbox(c.env, userId, false);
+
+    // Run ls commands to check file system state
+    const commands = [
+      'ls -la /root/.openclaw/ 2>&1 | head -20',
+      'cat /root/.openclaw/openclaw.json 2>&1 | head -50',
+    ];
+
+    const results: Record<string, string> = {};
+
+    for (const cmd of commands) {
+      try {
+        const { waitForProcess } = await import('../gateway/utils');
+        const proc = await sandbox.startProcess(cmd);
+        await waitForProcess(proc, 5000);
+        const logs = await proc.getLogs();
+        results[cmd] = logs.stdout || logs.stderr || '(no output)';
+      } catch (e) {
+        results[cmd] = `Error: ${e instanceof Error ? e.message : 'Unknown'}`;
+      }
+    }
+
+    // If sync requested, run tar-based backup via Worker
+    if (doSync) {
+      const { syncToR2 } = await import('../gateway');
+      const syncResult = await syncToR2(sandbox, c.env, { r2Prefix: `users/${userId}` });
+      results['tar-backup'] = JSON.stringify(syncResult);
+    }
+
+    return c.json({
+      userId,
+      sandboxName,
+      files: results,
+    });
+  } catch (error) {
+    return c.json({
+      error: error instanceof Error ? error.message : 'Unknown error',
+      userId,
+    }, 500);
+  }
+});
+
+// GET /api/super/users/:userId/force-sync - Force sync a user's container
+adminRouter.get('/users/:userId/force-sync', requireSuperAuth, async (c) => {
+  const userId = c.req.param('userId');
+  const sandboxName = `openclaw-${userId}`;
+
+  try {
+    const sandbox = await getUserSandbox(c.env, userId, false);
+
+    // Run tar-based backup via Worker
+    const { syncToR2 } = await import('../gateway');
+    const result = await syncToR2(sandbox, c.env, { r2Prefix: `users/${userId}` });
+
+    return c.json({
+      success: result.success,
+      userId,
+      sandboxName,
+      lastSync: result.lastSync || null,
+      syncId: result.syncId,
+      durationMs: result.durationMs,
+      error: result.error,
+    });
+  } catch (error) {
+    return c.json({
+      error: error instanceof Error ? error.message : 'Unknown error',
+      userId,
+    }, 500);
+  }
+});
+
+// GET /api/super/users/:userId/force-restart - Kill gateway and restart
+adminRouter.get('/users/:userId/force-restart', requireSuperAuth, async (c) => {
+  const userId = c.req.param('userId');
+  const sandboxName = `openclaw-${userId}`;
+
+  try {
+    const sandbox = await getUserSandbox(c.env, userId, false);
+
+    console.log(`[RESTART] Skipping pre-sync for ${userId.slice(0, 8)} (will restore from R2 on startup)`);
+
+    // Kill all processes
+    const processes = await sandbox.listProcesses();
+    console.log(`[RESTART] Killing ${processes.length} processes...`);
+    for (const proc of processes) {
+      try { await proc.kill(); } catch { /* ignore */ }
+    }
+
+    await new Promise(r => setTimeout(r, 2000));
+
+    // Clear locks
+    await sandbox.startProcess('rm -f /tmp/openclaw-gateway.lock /root/.openclaw/gateway.lock 2>/dev/null');
+    await new Promise(r => setTimeout(r, 500));
+
+    // Start gateway - will restore from R2 automatically
+    const { ensureMoltbotGateway } = await import('../gateway');
+    const bootPromise = ensureMoltbotGateway(sandbox, c.env, userId).catch((e: Error) => console.error('Gateway start error:', e));
+    c.executionCtx.waitUntil(bootPromise);
+
+    return c.json({
+      success: true,
+      userId,
+      sandboxName,
+      message: 'Gateway restarting (recovery from R2 on startup)...',
+    });
+  } catch (error) {
+    return c.json({
+      error: error instanceof Error ? error.message : 'Unknown error',
+      userId,
+    }, 500);
+  }
 });
 
 // =============================================================================
@@ -211,21 +434,21 @@ adminRouter.get('/users/:id/r2-status', requireSuperAuth, async (c) => {
     const prefix = `users/${userId}/`;
 
     // Check for backup.tar.gz (new format)
-    const backupHead = await c.env.MOLTBOT_BUCKET.head(`${prefix}backup.tar.gz`);
+    const backupHead = await c.env.SMARTBOX_BUCKET.head(`${prefix}backup.tar.gz`);
 
     // Check for legacy files to determine format
-    const legacyListed = await c.env.MOLTBOT_BUCKET.list({ prefix: `${prefix}root/`, limit: 1 });
+    const legacyListed = await c.env.SMARTBOX_BUCKET.list({ prefix: `${prefix}root/`, limit: 1 });
     const hasLegacyRoot = legacyListed.objects.length > 0;
-    const openlawListed = await c.env.MOLTBOT_BUCKET.list({ prefix: `${prefix}openclaw/`, limit: 1 });
+    const openlawListed = await c.env.SMARTBOX_BUCKET.list({ prefix: `${prefix}openclaw/`, limit: 1 });
     const hasLegacyOpenclaw = openlawListed.objects.length > 0;
 
     const backupFormat = backupHead ? 'tar' : hasLegacyRoot ? 'legacy-root' : hasLegacyOpenclaw ? 'legacy-openclaw' : 'none';
 
     // Get sync marker
-    const lastSync = await c.env.MOLTBOT_BUCKET.get(`${prefix}.last-sync`);
+    const lastSync = await c.env.SMARTBOX_BUCKET.get(`${prefix}.last-sync`);
 
     // Get secrets keys (not values)
-    const secretsObj = await c.env.MOLTBOT_BUCKET.get(`${prefix}secrets.json`);
+    const secretsObj = await c.env.SMARTBOX_BUCKET.get(`${prefix}secrets.json`);
     let secretKeys: string[] | null = null;
     if (secretsObj) {
       try {
@@ -292,7 +515,7 @@ adminRouter.get('/users/:id/r2-health', requireSuperAuth, async (c) => {
   const userId = c.req.param('id');
 
   try {
-    const lastSync = await c.env.MOLTBOT_BUCKET.get(`users/${userId}/.last-sync`);
+    const lastSync = await c.env.SMARTBOX_BUCKET.get(`users/${userId}/.last-sync`);
 
     if (!lastSync) {
       return c.json({
@@ -552,7 +775,7 @@ adminRouter.get('/users/:id/state', requireSuperAuth, async (c) => {
     // Check R2 for last sync timestamp
     try {
       const syncKey = `users/${userId}/.last-sync`;
-      const syncObj = await c.env.MOLTBOT_BUCKET.get(syncKey);
+      const syncObj = await c.env.SMARTBOX_BUCKET.get(syncKey);
       if (syncObj) {
         const syncData = await syncObj.text();
         if (syncData) {
@@ -632,7 +855,7 @@ adminRouter.get('/users/:id/state/v2', requireSuperAuth, async (c) => {
   // Add last sync info from R2 if available
   try {
     const syncKey = `users/${userId}/.last-sync`;
-    const syncObj = await c.env.MOLTBOT_BUCKET.get(syncKey);
+    const syncObj = await c.env.SMARTBOX_BUCKET.get(syncKey);
     if (syncObj) {
       const syncData = await syncObj.text();
       state.lastSyncAt = syncData.split('|')[0] || syncData;
@@ -817,62 +1040,148 @@ adminRouter.post('/users/:id/wake', requireSuperAuth, async (c) => {
   }
 });
 
-// Auto-wake middleware helper
-async function withWake(env: any, userId: string, operation: () => Promise<Response>, executionCtx?: ExecutionContext): Promise<Response> {
-  const sandbox = await getUserSandbox(env, userId, true);
+// =============================================================================
+// Improved Wake & Retry Logic (consolidated from admin-improved.ts)
+// =============================================================================
 
-  // Check if container needs waking — look for gateway process specifically
-  let needsWake = false;
+interface WakeOptions {
+  maxWakeTimeMs?: number;
+  healthCheckTimeoutMs?: number;
+  retryAttempts?: number;
+}
+
+/** Check if an error is retryable (transient) */
+function isRetryableError(error: Error): boolean {
+  const retryableMessages = [
+    'timeout', 'hibernating', 'not ready', 'connection refused',
+    'sandbox_not_found', 'instanceGetTimeout', 'portReadyTimeout',
+    'ECONNREFUSED', 'ETIMEDOUT', 'gateway failed to start', 'process not found',
+  ];
+  const message = error.message.toLowerCase();
+  return retryableMessages.some(m => message.includes(m.toLowerCase()));
+}
+
+/** Check if container is responsive by running a simple command */
+async function checkContainerHealth(sandbox: any, timeoutMs = 5000): Promise<boolean> {
   try {
-    const processes = await sandbox.listProcesses();
-    const gatewayRunning = processes.some((p: any) =>
-      (p.command?.includes('openclaw gateway') || p.command?.includes('openclaw-gateway') || p.command?.includes('start-moltbot.sh')) &&
-      p.status === 'running'
+    const healthProc = await sandbox.startProcess('echo "health-check"');
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Health check timeout')), timeoutMs)
     );
-    if (!gatewayRunning) {
-      needsWake = true;
-    }
+    await Promise.race([healthProc.waitForExit(5000), timeoutPromise]);
+    const logs = await healthProc.getLogs();
+    return logs.stdout?.includes('health-check') ?? false;
   } catch {
-    needsWake = true;
+    return false;
+  }
+}
+
+/** Wake container with extended timeout and health verification */
+async function wakeContainer(env: any, userId: string, maxWaitMs: number): Promise<void> {
+  const { ensureMoltbotGateway } = await import('../gateway');
+  console.log(`[WAKE] Waking container for ${userId} (max ${maxWaitMs}ms)...`);
+
+  try {
+    const sandbox = await getUserSandbox(env, userId, true);
+    const processes = await sandbox.listProcesses();
+    for (const proc of processes) {
+      try { await proc.kill(); } catch {}
+    }
+  } catch (e) {
+    console.log(`[WAKE] No processes to kill or sandbox not ready:`, e);
   }
 
-  // Wake if needed
-  if (needsWake) {
-    const { ensureMoltbotGateway } = await import('../gateway');
-    console.log(`[AUTO-WAKE] Waking container for ${userId} before operation`);
+  await new Promise(r => setTimeout(r, 1000));
 
-    // Kill stale processes (batch)
+  const sandbox = await getUserSandbox(env, userId, true);
+  const bootPromise = ensureMoltbotGateway(sandbox, env, userId).catch((err: Error) => {
+    console.error(`[WAKE] Gateway start failed for ${userId}:`, err);
+    throw err;
+  });
+
+  const pollIntervalMs = 2000;
+  const startTime = Date.now();
+  let lastError: Error | null = null;
+
+  while (Date.now() - startTime < maxWaitMs) {
+    await new Promise(r => setTimeout(r, pollIntervalMs));
     try {
-      await sandbox.killAllProcesses();
-    } catch {}
-
-    await new Promise(r => setTimeout(r, 1000));
-
-    // Start gateway
-    const bootPromise = ensureMoltbotGateway(sandbox, env, userId).catch(() => {});
-    
-    // Use waitUntil if available to keep the worker alive
-    if (executionCtx?.waitUntil) {
-      executionCtx.waitUntil(bootPromise);
+      const processes = await sandbox.listProcesses();
+      const gatewayRunning = processes.some((p: any) =>
+        p.command?.includes('openclaw gateway') && p.status === 'running'
+      );
+      if (gatewayRunning && await checkContainerHealth(sandbox, 5000)) {
+        console.log(`[WAKE] Container for ${userId} is ready (${Date.now() - startTime}ms)`);
+        return;
+      }
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e));
     }
+  }
 
-    // Wait for it to be ready
-    const maxWaitMs = 30000;
-    const pollIntervalMs = 1000;
-    const startTime = Date.now();
+  throw new Error(
+    `Container failed to become ready within ${maxWaitMs}ms. Last error: ${lastError?.message || 'None'}`
+  );
+}
 
-    while (Date.now() - startTime < maxWaitMs) {
-      await new Promise(r => setTimeout(r, pollIntervalMs));
+/** Execute operation with wake and retry logic (improved from withWake) */
+async function withWakeAndRetry(
+  env: any,
+  userId: string,
+  operation: () => Promise<Response>,
+  options: WakeOptions = {}
+): Promise<Response> {
+  const {
+    maxWakeTimeMs = 120_000,
+    healthCheckTimeoutMs = 10_000,
+    retryAttempts = 3,
+  } = options;
+
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt < retryAttempts; attempt++) {
+    try {
+      const sandbox = await getUserSandbox(env, userId, true);
+
+      let needsWake = false;
       try {
         const processes = await sandbox.listProcesses();
-        if (processes.some((p: any) => p.command?.includes('openclaw gateway') && p.status === 'running')) {
-          break;
-        }
-      } catch {}
+        const gatewayRunning = processes.some((p: any) =>
+          (p.command?.includes('openclaw gateway') || p.command?.includes('openclaw-gateway') || p.command?.includes('start-moltbot.sh')) &&
+          p.status === 'running'
+        );
+        if (!gatewayRunning) needsWake = true;
+        else if (!await checkContainerHealth(sandbox, healthCheckTimeoutMs)) needsWake = true;
+      } catch {
+        needsWake = true;
+      }
+
+      if (needsWake) {
+        await wakeContainer(env, userId, maxWakeTimeMs);
+      }
+
+      return await operation();
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      if (!isRetryableError(lastError)) break;
+
+      const delayMs = Math.min(1000 * Math.pow(2, attempt), 5000);
+      console.log(`[WAKE] Attempt ${attempt + 1}/${retryAttempts} failed for ${userId}, retrying in ${delayMs}ms...`);
+      await new Promise(r => setTimeout(r, delayMs));
     }
   }
 
-  return await operation();
+  return new Response(JSON.stringify({
+    error: 'Container operation failed after retries',
+    details: lastError?.message,
+    attempts: retryAttempts,
+    userId,
+  }), { status: 503, headers: { 'Content-Type': 'application/json' } });
+}
+
+// Legacy alias (kept for backward compat within this file)
+async function withWake(env: any, userId: string, operation: () => Promise<Response>): Promise<Response> {
+  return withWakeAndRetry(env, userId, operation);
 }
 
 // Store for async exec results (in-memory, per-worker)
@@ -975,57 +1284,82 @@ adminRouter.get('/users/:id/exec/:execId/status', requireSuperAuth, async (c) =>
 // Phase 1: Native File Operations
 // =============================================================================
 
-// GET /api/super/users/:id/files/:path{.+} - Read file from container
+// GET /api/super/users/:id/files/:path{.+} - Read file with R2-first fallback
 adminRouter.get('/users/:id/files/:path{.+}', requireSuperAuth, async (c) => {
   const userId = c.req.param('id');
   const rawPath = c.req.param('path') || '';
+  const source = c.req.query('source') || 'auto'; // 'r2', 'container', 'auto'
 
   if (!rawPath) {
     return c.json({ error: 'File path is required' }, 400);
   }
 
-  // Ensure path starts with / for absolute paths
   const filePath = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
 
-  return await withWake(c.env, userId, async () => {
-    const sandbox = await getUserSandbox(c.env, userId, true);
-
+  // R2-first: Try R2 backup if requested or auto
+  if (source === 'r2' || source === 'auto') {
     try {
-      // Use cat via startProcess — most reliable across SDK versions
-      const { waitForProcess } = await import('../gateway/utils');
-      const proc = await sandbox.startProcess(`cat '${filePath}' 2>&1`);
-      await waitForProcess(proc, 5000);
-      const logs = await proc.getLogs();
-      
-      if (proc.exitCode !== 0) {
-        const stderr = logs.stderr || logs.stdout || '';
-        if (stderr.includes('No such file') || stderr.includes('not found')) {
-          return c.json({ userId, path: filePath, error: 'File not found' }, 404);
+      const r2Key = `users/${userId}${filePath}`;
+      const r2Obj = await c.env.SMARTBOX_BUCKET.get(r2Key);
+      if (r2Obj) {
+        if (r2Obj.size > 5 * 1024 * 1024) {
+          return c.json({
+            userId, path: filePath, size: r2Obj.size, source: 'r2',
+            lastModified: r2Obj.uploaded,
+            message: 'File too large (>5MB), use range request or container access',
+          });
         }
-        if (stderr.includes('Is a directory')) {
-          // It's a directory — list it instead
-          const lsProc = await sandbox.startProcess(`ls -la '${filePath}' 2>&1`);
-          await waitForProcess(lsProc, 5000);
-          const lsLogs = await lsProc.getLogs();
-          return c.json({ userId, path: filePath, type: 'directory', listing: lsLogs.stdout || '' });
-        }
-        return c.json({ userId, path: filePath, error: stderr }, 500);
+        const content = await r2Obj.text();
+        return c.json({
+          userId, path: filePath, content, source: 'r2',
+          size: content.length, lastModified: r2Obj.uploaded,
+          timestamp: new Date().toISOString(),
+        });
       }
-
-      return c.json({
-        userId,
-        path: filePath,
-        content: logs.stdout || '',
-        timestamp: new Date().toISOString(),
-      });
-    } catch (error) {
-      return c.json({
-        userId,
-        path: filePath,
-        error: error instanceof Error ? error.message : 'Unknown error',
-      }, 500);
+    } catch (r2Error) {
+      console.log(`[FILES] R2 read failed for ${filePath}:`, r2Error);
     }
-  });
+  }
+
+  // Container fallback
+  if (source === 'container' || source === 'auto') {
+    return await withWakeAndRetry(c.env, userId, async () => {
+      const sandbox = await getUserSandbox(c.env, userId, true);
+      try {
+        const { waitForProcess } = await import('../gateway/utils');
+        const proc = await sandbox.startProcess(`cat '${filePath}' 2>&1`);
+        await waitForProcess(proc, 5000);
+        const logs = await proc.getLogs();
+
+        if (proc.exitCode !== 0) {
+          const stderr = logs.stderr || logs.stdout || '';
+          if (stderr.includes('No such file') || stderr.includes('not found')) {
+            return c.json({ userId, path: filePath, error: 'File not found', source: 'container' }, 404);
+          }
+          if (stderr.includes('Is a directory')) {
+            const lsProc = await sandbox.startProcess(`ls -la '${filePath}' 2>&1`);
+            await waitForProcess(lsProc, 5000);
+            const lsLogs = await lsProc.getLogs();
+            return c.json({ userId, path: filePath, type: 'directory', listing: lsLogs.stdout || '', source: 'container' });
+          }
+          return c.json({ userId, path: filePath, error: stderr, source: 'container' }, 500);
+        }
+
+        return c.json({
+          userId, path: filePath, content: logs.stdout || '',
+          source: 'container', timestamp: new Date().toISOString(),
+        });
+      } catch (error) {
+        return c.json({
+          userId, path: filePath,
+          error: error instanceof Error ? error.message : 'Unknown error',
+          source: 'container',
+        }, 500);
+      }
+    });
+  }
+
+  return c.json({ error: 'File not found', path: filePath }, 404);
 });
 
 // HEAD /api/super/users/:id/files/:path{.+}/exists - Check file exists and get metadata
@@ -1116,7 +1450,7 @@ adminRouter.put('/users/:id/files/:path{.+}', requireSuperAuth, async (c) => {
       // Also backup to R2
       try {
         const r2Key = `users/${userId}/${path}`;
-        await c.env.MOLTBOT_BUCKET.put(r2Key, content, {
+        await c.env.SMARTBOX_BUCKET.put(r2Key, content, {
           httpMetadata: { contentType: 'application/octet-stream' },
         });
       } catch (r2Error) {
@@ -1221,6 +1555,97 @@ adminRouter.get('/users/:id/files', requireSuperAuth, async (c) => {
   });
 });
 
+// POST /api/super/users/:id/files/batch - Batch file operations
+adminRouter.post('/users/:id/files/batch', requireSuperAuth, async (c) => {
+  const userId = c.req.param('id');
+  const body = await c.req.json().catch(() => ({}));
+  const { operations, parallel = false } = body;
+
+  if (!Array.isArray(operations) || operations.length === 0) {
+    return c.json({ error: 'operations array is required' }, 400);
+  }
+  if (operations.length > 50) {
+    return c.json({ error: 'Maximum 50 operations per batch' }, 400);
+  }
+
+  for (const op of operations) {
+    if (!op.op || !['read', 'write', 'delete', 'exists'].includes(op.op)) {
+      return c.json({ error: `Invalid operation: ${op.op}` }, 400);
+    }
+    if (!op.path) {
+      return c.json({ error: 'Each operation requires a path' }, 400);
+    }
+    if (op.op === 'write' && typeof op.content !== 'string') {
+      return c.json({ error: 'Write operations require content string' }, 400);
+    }
+  }
+
+  return await withWakeAndRetry(c.env, userId, async () => {
+    const sandbox = await getUserSandbox(c.env, userId, true);
+    const { waitForProcess } = await import('../gateway/utils');
+
+    async function executeOp(op: any) {
+      const normalizedPath = op.path.startsWith('/') ? op.path : `/${op.path}`;
+      switch (op.op) {
+        case 'read': {
+          const proc = await sandbox.startProcess(`cat '${normalizedPath}' 2>&1`);
+          await waitForProcess(proc, 5000);
+          const logs = await proc.getLogs();
+          return {
+            path: normalizedPath, op: op.op,
+            success: proc.exitCode === 0,
+            content: proc.exitCode === 0 ? logs.stdout || '' : undefined,
+            error: proc.exitCode !== 0 ? (logs.stderr || logs.stdout || 'Read failed') : undefined,
+          };
+        }
+        case 'write': {
+          const dirPath = normalizedPath.substring(0, normalizedPath.lastIndexOf('/')) || '/';
+          if (dirPath !== '/') await sandbox.mkdir(dirPath, { recursive: true });
+          const result = await sandbox.writeFile(normalizedPath, op.content);
+          try {
+            await c.env.SMARTBOX_BUCKET.put(`users/${userId}${normalizedPath}`, op.content);
+          } catch { /* R2 sync best-effort */ }
+          return { path: normalizedPath, op: op.op, success: result.success, bytesWritten: op.content.length };
+        }
+        case 'delete': {
+          const result = await sandbox.deleteFile(normalizedPath);
+          return { path: normalizedPath, op: op.op, success: result.success };
+        }
+        case 'exists': {
+          const result = await sandbox.exists(normalizedPath);
+          return { path: normalizedPath, op: op.op, success: result.success, exists: result.exists };
+        }
+        default:
+          return { path: normalizedPath, op: op.op, success: false, error: 'Unknown operation' };
+      }
+    }
+
+    const results = parallel
+      ? await Promise.all(operations.map(async (op: any) => {
+          try { return await executeOp(op); }
+          catch (e) { return { path: op.path, op: op.op, success: false, error: e instanceof Error ? e.message : 'Unknown' }; }
+        }))
+      : await (async () => {
+          const r: any[] = [];
+          for (const op of operations) {
+            try { r.push(await executeOp(op)); }
+            catch (e) { r.push({ path: op.path, op: op.op, success: false, error: e instanceof Error ? e.message : 'Unknown' }); }
+          }
+          return r;
+        })();
+
+    return c.json({
+      userId,
+      completed: results.length,
+      succeeded: results.filter((r: any) => r.success).length,
+      failed: results.filter((r: any) => !r.success).length,
+      results,
+      parallel,
+      timestamp: new Date().toISOString(),
+    });
+  });
+});
+
 // =============================================================================
 // Phase 3: R2 Dropbox Pattern
 // =============================================================================
@@ -1264,7 +1689,7 @@ adminRouter.get('/users/:id/config', requireSuperAuth, async (c) => {
   try {
     // Read from R2 first (R2-first pattern)
     const configKey = `users/${userId}/openclaw/openclaw.json`;
-    const configObj = await c.env.MOLTBOT_BUCKET.get(configKey);
+    const configObj = await c.env.SMARTBOX_BUCKET.get(configKey);
 
     if (!configObj) {
       return c.json({
@@ -1319,7 +1744,7 @@ adminRouter.put('/users/:id/config', requireSuperAuth, async (c) => {
 
     // Get existing config for history
     try {
-      const existing = await c.env.MOLTBOT_BUCKET.get(configKey);
+      const existing = await c.env.SMARTBOX_BUCKET.get(configKey);
       if (existing) {
         const existingText = await existing.text();
         const historyEntry = {
@@ -1328,7 +1753,7 @@ adminRouter.put('/users/:id/config', requireSuperAuth, async (c) => {
         };
 
         // Append to history (simple approach - in production, consider limiting history size)
-        const existingHistory = await c.env.MOLTBOT_BUCKET.get(historyKey);
+        const existingHistory = await c.env.SMARTBOX_BUCKET.get(historyKey);
         let history: any[] = [];
         if (existingHistory) {
           try {
@@ -1342,7 +1767,7 @@ adminRouter.put('/users/:id/config', requireSuperAuth, async (c) => {
           history = history.slice(-10);
         }
 
-        await c.env.MOLTBOT_BUCKET.put(historyKey, JSON.stringify(history, null, 2), {
+        await c.env.SMARTBOX_BUCKET.put(historyKey, JSON.stringify(history, null, 2), {
           httpMetadata: { contentType: 'application/json' },
         });
       }
@@ -1352,7 +1777,7 @@ adminRouter.put('/users/:id/config', requireSuperAuth, async (c) => {
 
     // Write new config to R2
     const configText = JSON.stringify(config, null, 2);
-    await c.env.MOLTBOT_BUCKET.put(configKey, configText, {
+    await c.env.SMARTBOX_BUCKET.put(configKey, configText, {
       httpMetadata: { contentType: 'application/json' },
     });
 
@@ -1400,7 +1825,7 @@ adminRouter.get('/users/:id/config/history', requireSuperAuth, async (c) => {
 
   try {
     const historyKey = `users/${userId}/openclaw/openclaw.json.history`;
-    const historyObj = await c.env.MOLTBOT_BUCKET.get(historyKey);
+    const historyObj = await c.env.SMARTBOX_BUCKET.get(historyKey);
 
     if (!historyObj) {
       return c.json({
@@ -1451,7 +1876,7 @@ adminRouter.post('/users/:id/config/rollback', requireSuperAuth, async (c) => {
 
   try {
     const historyKey = `users/${userId}/openclaw/openclaw.json.history`;
-    const historyObj = await c.env.MOLTBOT_BUCKET.get(historyKey);
+    const historyObj = await c.env.SMARTBOX_BUCKET.get(historyKey);
 
     if (!historyObj) {
       return c.json({
@@ -1484,7 +1909,7 @@ adminRouter.post('/users/:id/config/rollback', requireSuperAuth, async (c) => {
     const configKey = `users/${userId}/openclaw/openclaw.json`;
 
     // Save current as new history entry
-    const currentObj = await c.env.MOLTBOT_BUCKET.get(configKey);
+    const currentObj = await c.env.SMARTBOX_BUCKET.get(configKey);
     if (currentObj) {
       const currentText = await currentObj.text();
       history.push({
@@ -1496,12 +1921,12 @@ adminRouter.post('/users/:id/config/rollback', requireSuperAuth, async (c) => {
 
     // Write rolled back config
     const configText = JSON.stringify(targetConfig, null, 2);
-    await c.env.MOLTBOT_BUCKET.put(configKey, configText, {
+    await c.env.SMARTBOX_BUCKET.put(configKey, configText, {
       httpMetadata: { contentType: 'application/json' },
     });
 
     // Update history
-    await c.env.MOLTBOT_BUCKET.put(historyKey, JSON.stringify(history, null, 2), {
+    await c.env.SMARTBOX_BUCKET.put(historyKey, JSON.stringify(history, null, 2), {
       httpMetadata: { contentType: 'application/json' },
     });
 
@@ -1776,7 +2201,7 @@ adminRouter.patch('/users/:id/config', requireSuperAuth, async (c) => {
     const configKey = `users/${userId}/openclaw/openclaw.json`;
 
     // GET existing config
-    const existing = await c.env.MOLTBOT_BUCKET.get(configKey);
+    const existing = await c.env.SMARTBOX_BUCKET.get(configKey);
     let currentConfig: any = {};
     if (existing) {
       try {
@@ -1793,20 +2218,20 @@ adminRouter.patch('/users/:id/config', requireSuperAuth, async (c) => {
     // Save history
     try {
       const historyKey = `users/${userId}/openclaw/openclaw.json.history`;
-      const existingHistory = await c.env.MOLTBOT_BUCKET.get(historyKey);
+      const existingHistory = await c.env.SMARTBOX_BUCKET.get(historyKey);
       let history: any[] = [];
       if (existingHistory) {
         try { history = JSON.parse(await existingHistory.text()); } catch {}
       }
       history.push({ timestamp: new Date().toISOString(), config: currentConfig });
       if (history.length > 10) history = history.slice(-10);
-      await c.env.MOLTBOT_BUCKET.put(historyKey, JSON.stringify(history, null, 2), {
+      await c.env.SMARTBOX_BUCKET.put(historyKey, JSON.stringify(history, null, 2), {
         httpMetadata: { contentType: 'application/json' },
       });
     } catch { /* ignore history errors */ }
 
     // PUT merged config
-    await c.env.MOLTBOT_BUCKET.put(configKey, configText, {
+    await c.env.SMARTBOX_BUCKET.put(configKey, configText, {
       httpMetadata: { contentType: 'application/json' },
     });
 
@@ -1866,7 +2291,7 @@ adminRouter.post('/bulk/config-patch', requireSuperAuth, async (c) => {
   for (const userId of targetIds) {
     try {
       const configKey = `users/${userId}/openclaw/openclaw.json`;
-      const existing = await c.env.MOLTBOT_BUCKET.get(configKey);
+      const existing = await c.env.SMARTBOX_BUCKET.get(configKey);
       let currentConfig: any = {};
       if (existing) {
         try { currentConfig = JSON.parse(await existing.text()); } catch {}
@@ -1875,7 +2300,7 @@ adminRouter.post('/bulk/config-patch', requireSuperAuth, async (c) => {
       const merged = deepMerge(currentConfig, patch);
       const configText = JSON.stringify(merged, null, 2);
 
-      await c.env.MOLTBOT_BUCKET.put(configKey, configText, {
+      await c.env.SMARTBOX_BUCKET.put(configKey, configText, {
         httpMetadata: { contentType: 'application/json' },
       });
 

@@ -38,20 +38,50 @@ export interface SyncOptions {
 }
 
 /**
- * In-memory storage for recent sync results (for debugging)
- */
-const recentSyncResults: Map<string, SyncResult[]> = new Map();
-const MAX_RECENT_RESULTS = 10;
-
-/**
  * In-memory lock to prevent concurrent syncs for the same user.
  * Key is r2Prefix, value is timestamp when sync started.
+ * Must be per-instance (not persisted) — it's a coordination lock.
  */
 const syncLocks: Map<string, number> = new Map();
 const SYNC_LOCK_TIMEOUT_MS = 60_000; // 60 seconds max sync duration
 
 /**
- * Get recent sync results for a user (for debugging)
+ * Get recent sync results for a user from D1.
+ * Falls back to empty array if D1 is unavailable.
+ */
+export async function getRecentSyncResultsFromDB(db: D1Database, userId: string): Promise<SyncResult[]> {
+  try {
+    const { results } = await db.prepare(
+      `SELECT success, sync_id, duration_ms, file_count, error, created_at
+       FROM sync_history WHERE user_id = ? ORDER BY created_at DESC LIMIT 10`
+    ).bind(userId).all<{
+      success: number;
+      sync_id: string | null;
+      duration_ms: number | null;
+      file_count: number | null;
+      error: string | null;
+      created_at: string;
+    }>();
+    return results.map(r => ({
+      success: r.success === 1,
+      syncId: r.sync_id ?? undefined,
+      durationMs: r.duration_ms ?? undefined,
+      fileCount: r.file_count ?? undefined,
+      error: r.error ?? undefined,
+      lastSync: r.success === 1 ? r.created_at : undefined,
+    }));
+  } catch (e) {
+    console.warn('[SYNC] D1 read failed:', e);
+    return [];
+  }
+}
+
+/** In-memory fallback for recent sync results (for code without D1) */
+const recentSyncResults: Map<string, SyncResult[]> = new Map();
+const MAX_RECENT_RESULTS = 10;
+
+/**
+ * Get recent sync results for a user (sync fallback — in-memory only)
  */
 export function getRecentSyncResults(r2Prefix?: string): SyncResult[] {
   const key = r2Prefix || 'default';
@@ -59,8 +89,26 @@ export function getRecentSyncResults(r2Prefix?: string): SyncResult[] {
 }
 
 /**
- * Get count of consecutive sync failures (from most recent)
+ * Get count of consecutive sync failures from D1, with in-memory fallback
  */
+export async function getConsecutiveSyncFailuresFromDB(db: D1Database, userId: string): Promise<number> {
+  try {
+    const { results } = await db.prepare(
+      `SELECT success FROM sync_history WHERE user_id = ? ORDER BY created_at DESC LIMIT 10`
+    ).bind(userId).all<{ success: number }>();
+    let count = 0;
+    for (const r of results) {
+      if (r.success === 0) count++;
+      else break;
+    }
+    return count;
+  } catch (e) {
+    console.warn('[SYNC] D1 failure count failed:', e);
+    return getConsecutiveSyncFailures();
+  }
+}
+
+/** Sync fallback (in-memory) */
 export function getConsecutiveSyncFailures(r2Prefix?: string): number {
   const results = getRecentSyncResults(r2Prefix);
   let count = 0;
@@ -68,16 +116,17 @@ export function getConsecutiveSyncFailures(r2Prefix?: string): number {
     if (!result.success) {
       count++;
     } else {
-      break; // Stop at first success
+      break;
     }
   }
   return count;
 }
 
 /**
- * Store a sync result for debugging
+ * Store a sync result — writes to both in-memory and D1
  */
-function storeSyncResult(r2Prefix: string | undefined, result: SyncResult): void {
+async function storeSyncResult(r2Prefix: string | undefined, result: SyncResult, db?: D1Database): Promise<void> {
+  // In-memory
   const key = r2Prefix || 'default';
   const results = recentSyncResults.get(key) || [];
   results.unshift(result);
@@ -85,6 +134,27 @@ function storeSyncResult(r2Prefix: string | undefined, result: SyncResult): void
     results.pop();
   }
   recentSyncResults.set(key, results);
+
+  // D1
+  if (db && r2Prefix) {
+    // Extract userId from r2Prefix (format: "users/{userId}")
+    const userId = r2Prefix.replace('users/', '');
+    try {
+      await db.prepare(
+        `INSERT INTO sync_history (user_id, success, sync_id, duration_ms, file_count, error)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).bind(
+        userId,
+        result.success ? 1 : 0,
+        result.syncId ?? null,
+        result.durationMs ?? null,
+        result.fileCount ?? null,
+        result.error ?? null,
+      ).run();
+    } catch (e) {
+      console.warn('[SYNC] D1 write failed:', e);
+    }
+  }
 }
 
 /**
@@ -112,7 +182,7 @@ export async function syncToR2(
         details: `Another sync started ${Math.round(lockAge / 1000)}s ago. Skipping to prevent race condition.`,
         durationMs: Date.now() - startTime,
       };
-      storeSyncResult(options.r2Prefix, result);
+      await storeSyncResult(options.r2Prefix, result, env.PLATFORM_DB);
       return result;
     }
     // Lock is stale, clear it
@@ -135,7 +205,7 @@ export async function syncToR2(
       rsyncExitCode: tarResult.success ? 0 : undefined,
     };
 
-    storeSyncResult(options.r2Prefix, result);
+    await storeSyncResult(options.r2Prefix, result, env.PLATFORM_DB);
     return result;
   } finally {
     // Release lock

@@ -11,11 +11,30 @@ const CIRCUIT_BREAKER_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 const CIRCUIT_BREAKER_THRESHOLD = 5; // Max 5 restarts in window
 
 /**
- * Check if circuit breaker is tripped for a user
+ * Check if circuit breaker is tripped for a user.
+ * On cache miss, loads from D1 if db is provided.
  */
-export function isCircuitBreakerTripped(userId: string): boolean {
+export async function isCircuitBreakerTrippedAsync(userId: string, db?: D1Database): Promise<boolean> {
   const now = Date.now();
-  const entry = restartCounts.get(userId);
+  let entry = restartCounts.get(userId);
+
+  // Cache miss — try D1
+  if (!entry && db) {
+    try {
+      const row = await db.prepare(
+        'SELECT restart_count, window_start FROM circuit_breaker WHERE user_id = ?'
+      ).bind(userId).first<{ restart_count: number; window_start: string }>();
+      if (row) {
+        const windowStart = new Date(row.window_start).getTime();
+        if (now - windowStart <= CIRCUIT_BREAKER_WINDOW_MS) {
+          entry = { count: row.restart_count, windowStart };
+          restartCounts.set(userId, entry);
+        }
+      }
+    } catch (e) {
+      console.warn('[CIRCUIT-BREAKER] D1 load failed:', e);
+    }
+  }
 
   if (!entry) return false;
 
@@ -28,19 +47,60 @@ export function isCircuitBreakerTripped(userId: string): boolean {
   return entry.count >= CIRCUIT_BREAKER_THRESHOLD;
 }
 
+/** Sync version (in-memory only) */
+export function isCircuitBreakerTripped(userId: string): boolean {
+  const now = Date.now();
+  const entry = restartCounts.get(userId);
+  if (!entry) return false;
+  if (now - entry.windowStart > CIRCUIT_BREAKER_WINDOW_MS) {
+    restartCounts.delete(userId);
+    return false;
+  }
+  return entry.count >= CIRCUIT_BREAKER_THRESHOLD;
+}
+
 /**
- * Increment restart count for circuit breaker
+ * Increment restart count for circuit breaker.
+ * Writes to both in-memory Map and D1.
  */
-export function recordRestartForCircuitBreaker(userId: string): void {
+export async function recordRestartForCircuitBreakerAsync(userId: string, db?: D1Database): Promise<void> {
   const now = Date.now();
   const entry = restartCounts.get(userId);
 
   if (!entry || now - entry.windowStart > CIRCUIT_BREAKER_WINDOW_MS) {
-    // Start new window
     restartCounts.set(userId, { count: 1, windowStart: now });
     console.log(`[CIRCUIT-BREAKER] ${userId.slice(0, 8)}: 1 restart in new window`);
   } else {
-    // Increment in current window
+    entry.count++;
+    console.log(`[CIRCUIT-BREAKER] ${userId.slice(0, 8)}: ${entry.count} restarts in current window`);
+  }
+
+  // Persist to D1
+  if (db) {
+    try {
+      const current = restartCounts.get(userId)!;
+      await db.prepare(
+        `INSERT INTO circuit_breaker (user_id, restart_count, window_start, updated_at)
+         VALUES (?, ?, ?, datetime('now'))
+         ON CONFLICT(user_id) DO UPDATE SET
+           restart_count = excluded.restart_count,
+           window_start = excluded.window_start,
+           updated_at = datetime('now')`
+      ).bind(userId, current.count, new Date(current.windowStart).toISOString()).run();
+    } catch (e) {
+      console.warn('[CIRCUIT-BREAKER] D1 write failed:', e);
+    }
+  }
+}
+
+/** Sync version (in-memory only, kept for backward compat) */
+export function recordRestartForCircuitBreaker(userId: string): void {
+  const now = Date.now();
+  const entry = restartCounts.get(userId);
+  if (!entry || now - entry.windowStart > CIRCUIT_BREAKER_WINDOW_MS) {
+    restartCounts.set(userId, { count: 1, windowStart: now });
+    console.log(`[CIRCUIT-BREAKER] ${userId.slice(0, 8)}: 1 restart in new window`);
+  } else {
     entry.count++;
     console.log(`[CIRCUIT-BREAKER] ${userId.slice(0, 8)}: ${entry.count} restarts in current window`);
   }
@@ -130,23 +190,82 @@ export function getAllHealthStates(): Map<string, HealthState> {
 }
 
 /**
+ * Load health state from D1 on cache miss
+ */
+async function loadHealthStateFromDB(db: D1Database, userId: string): Promise<HealthState | undefined> {
+  try {
+    const row = await db.prepare(
+      'SELECT consecutive_failures, last_check, last_healthy, last_restart FROM health_states WHERE user_id = ?'
+    ).bind(userId).first<{
+      consecutive_failures: number;
+      last_check: string | null;
+      last_healthy: string | null;
+      last_restart: string | null;
+    }>();
+    if (row) {
+      return {
+        consecutiveFailures: row.consecutive_failures,
+        lastCheck: row.last_check || new Date().toISOString(),
+        lastHealthy: row.last_healthy,
+        lastRestart: row.last_restart,
+      };
+    }
+  } catch (e) {
+    console.warn('[HEALTH] D1 load failed:', e);
+  }
+  return undefined;
+}
+
+/**
+ * Persist health state to D1
+ */
+async function saveHealthStateToDB(db: D1Database, userId: string, state: HealthState): Promise<void> {
+  try {
+    await db.prepare(
+      `INSERT INTO health_states (user_id, consecutive_failures, last_check, last_healthy, last_restart, updated_at)
+       VALUES (?, ?, ?, ?, ?, datetime('now'))
+       ON CONFLICT(user_id) DO UPDATE SET
+         consecutive_failures = excluded.consecutive_failures,
+         last_check = excluded.last_check,
+         last_healthy = excluded.last_healthy,
+         last_restart = excluded.last_restart,
+         updated_at = datetime('now')`
+    ).bind(
+      userId,
+      state.consecutiveFailures,
+      state.lastCheck,
+      state.lastHealthy,
+      state.lastRestart,
+    ).run();
+  } catch (e) {
+    console.warn('[HEALTH] D1 write failed:', e);
+  }
+}
+
+/**
  * Perform a health check on a user's sandbox
  *
  * @param sandbox - The sandbox instance
  * @param userId - User ID for tracking state
  * @param config - Health check configuration
+ * @param db - Optional D1 database for persistence
  * @returns Health check result
  */
 export async function checkHealth(
   sandbox: Sandbox,
   userId: string,
-  config: Partial<HealthCheckConfig> = {}
+  config: Partial<HealthCheckConfig> = {},
+  db?: D1Database,
 ): Promise<HealthCheckResult> {
   const cfg = { ...DEFAULT_CONFIG, ...config };
   const now = new Date().toISOString();
 
-  // Get or create health state
+  // Get or create health state (load from D1 on cold start)
   let state = healthStates.get(userId);
+  if (!state && db) {
+    state = await loadHealthStateFromDB(db, userId) ?? undefined;
+    if (state) healthStates.set(userId, state);
+  }
   if (!state) {
     state = {
       consecutiveFailures: 0,
@@ -232,11 +351,17 @@ export async function checkHealth(
   }
   result.consecutiveFailures = state.consecutiveFailures;
 
+  // Persist to D1
+  if (db) {
+    await saveHealthStateToDB(db, userId, state);
+  }
+
   return result;
 }
 
 /**
- * Check if a sandbox should be restarted based on health state
+ * Check if a sandbox should be restarted based on health state.
+ * Implements exponential backoff: immediate → 2min → 4min → 8min → 10min cap.
  */
 export function shouldRestart(userId: string, config: Partial<HealthCheckConfig> = {}): boolean {
   // Check circuit breaker first
@@ -248,12 +373,50 @@ export function shouldRestart(userId: string, config: Partial<HealthCheckConfig>
   const cfg = { ...DEFAULT_CONFIG, ...config };
   const state = healthStates.get(userId);
   if (!state) return false;
-  return state.consecutiveFailures >= cfg.failuresBeforeRestart;
+
+  if (state.consecutiveFailures < cfg.failuresBeforeRestart) {
+    return false;
+  }
+
+  // Exponential backoff based on restart count within circuit breaker window
+  if (state.lastRestart) {
+    const entry = restartCounts.get(userId);
+    const restartCount = entry?.count ?? 0;
+    if (restartCount > 0) {
+      const BACKOFF_BASE_MS = 2 * 60 * 1000; // 2 minutes
+      const BACKOFF_CAP_MS = 10 * 60 * 1000; // 10 minutes
+      const backoffMs = Math.min(BACKOFF_BASE_MS * Math.pow(2, restartCount - 1), BACKOFF_CAP_MS);
+      const timeSinceLastRestart = Date.now() - new Date(state.lastRestart).getTime();
+      if (timeSinceLastRestart < backoffMs) {
+        console.log(
+          `[HEALTH] Backoff: ${userId.slice(0, 8)} restart #${restartCount} ` +
+          `waiting ${Math.round((backoffMs - timeSinceLastRestart) / 1000)}s ` +
+          `(backoff: ${Math.round(backoffMs / 1000)}s)`
+        );
+        return false;
+      }
+    }
+  }
+
+  return true;
 }
 
 /**
- * Record that a restart was performed
+ * Record that a restart was performed.
+ * Updates both in-memory and D1 state.
  */
+export async function recordRestartAsync(userId: string, db?: D1Database): Promise<void> {
+  const state = healthStates.get(userId);
+  if (state) {
+    state.lastRestart = new Date().toISOString();
+    state.consecutiveFailures = 0;
+    if (db) {
+      await saveHealthStateToDB(db, userId, state);
+    }
+  }
+}
+
+/** Sync version (in-memory only, kept for backward compat) */
 export function recordRestart(userId: string): void {
   const state = healthStates.get(userId);
   if (state) {

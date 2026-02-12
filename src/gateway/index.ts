@@ -4,22 +4,34 @@ export type { TarBackupResult, TarRestoreResult } from './tar-backup';
 export { presignR2Url, presignRestoreUrl, presignBackupUrl } from './presign';
 export { findExistingMoltbotProcess, ensureMoltbotGateway, restartContainer } from './process';
 export { createDailyBackup, createRollingBackup, listBackupDates, restoreUserFromBackup } from './backup';
-export { syncToR2, getRecentSyncResults, getConsecutiveSyncFailures, syncCriticalFilesToR2, syncBeforeShutdown } from './sync';
+export { syncToR2, getRecentSyncResults, getRecentSyncResultsFromDB, getConsecutiveSyncFailures, getConsecutiveSyncFailuresFromDB, syncCriticalFilesToR2, syncBeforeShutdown } from './sync';
 export type { SyncResult } from './sync';
 export { waitForProcess } from './utils';
 export {
   checkHealth,
   shouldRestart,
   recordRestart,
+  recordRestartAsync,
   resetHealthState,
   getHealthState,
   getAllHealthStates,
   isCircuitBreakerTripped,
+  isCircuitBreakerTrippedAsync,
   recordRestartForCircuitBreaker,
+  recordRestartForCircuitBreakerAsync,
   resetCircuitBreaker,
 } from './health';
 export type { HealthCheckResult, HealthCheckConfig } from './health';
-export { getSandboxForUser, getInstanceTypeName, getTierForUser, setUserTier, getAllTierAssignments } from './tiers';
+export { getSandboxForUser, getInstanceTypeName, getTierForUser, getSandboxName, getAllTierAssignments, getTierForUserFromDB } from './tiers';
+
+// Resource monitoring
+export {
+  collectAllContainerStats,
+  getAllContainerStats,
+  getContainerStats,
+  getFleetResourceSummary,
+} from './resource-monitor';
+export type { ContainerStats, ResourceSample } from './resource-monitor';
 
 // Zero-data-loss backup system (Week 1)
 export {

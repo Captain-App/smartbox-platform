@@ -1,11 +1,11 @@
 /**
- * OpenClaw - Multi-Tenant Bot Platform (v2026.02.06)
+ * OpenClaw - Multi-Tenant Bot Platform (v2026.02.12)
  *
  * This Worker runs personal AI assistant instances in Cloudflare Sandbox containers.
  * Each authenticated user gets their own isolated sandbox and R2 storage.
  *
  * Features:
- * - Per-user sandbox isolation (openclaw-{userId})
+ * - Per-user sandbox isolation ({firstname}-{telegram}-{tier}-ss{shortid})
  * - Per-user R2 storage (users/{userId}/)
  * - Supabase authentication
  * - Web UI (Control Dashboard + WebChat) at /
@@ -28,54 +28,18 @@ import { Hono } from 'hono';
 import { getSandbox, Sandbox, type SandboxOptions } from '@cloudflare/sandbox';
 
 import type { AppEnv, MoltbotEnv, AuthenticatedUser } from './types';
-import { MOLTBOT_PORT, HEALTH_CHECK_CONFIG } from './config';
 import { createSupabaseAuthMiddleware } from '../platform/auth';
 import {
   ensureMoltbotGateway,
-  findExistingMoltbotProcess,
-  syncToR2,
-  syncCriticalFilesToR2,
-  getConsecutiveSyncFailures,
-  deriveUserGatewayToken,
-  getGatewayMasterToken,
-  checkHealth,
-  shouldRestart,
-  recordRestart,
-  recordRestartForCircuitBreaker,
-  createDailyBackup,
-  createRollingBackup,
   getSandboxForUser,
   getInstanceTypeName,
-  getTierForUser,
-  runPostRestartVerification,
-  restartContainer,
+  getGatewayMasterToken,
 } from './gateway';
-import { isBackupFeatureEnabled } from './config/backup';
-import {
-  createIssue,
-  logSyncEvent,
-  logHealthEvent,
-  logRestartEvent,
-} from './monitoring';
-import { publicRoutes, api, adminUi, debug, cdp, relayRoutes } from './routes';
+import { publicRoutes, api, adminUi, debug, cdp, relayRoutes, adminRouter } from './routes';
 import { redactSensitiveParams } from './utils/logging';
-import loadingPageHtml from './assets/loading.html';
 import configErrorHtml from './assets/config-error.html';
-
-/**
- * Transform error messages from the gateway to be more user-friendly.
- */
-function transformErrorMessage(message: string, host: string): string {
-  if (message.includes('gateway token missing') || message.includes('gateway token mismatch')) {
-    return `Invalid or missing token. Visit https://${host}?token={REPLACE_WITH_YOUR_TOKEN}`;
-  }
-
-  if (message.includes('pairing required')) {
-    return `Pairing required. Visit https://${host}/_admin/`;
-  }
-
-  return message;
-}
+import { proxyHandler } from './proxy';
+import { scheduled as scheduledHandler } from './scheduled';
 
 /**
  * Validate required environment variables.
@@ -110,14 +74,10 @@ function validateRequiredEnv(env: MoltbotEnv): string[] {
 
 /**
  * Build sandbox options based on environment configuration.
- * 
+ *
  * SANDBOX_SLEEP_AFTER controls how long the container stays alive after inactivity:
  * - 'never' (default): Container stays alive indefinitely (recommended due to long cold starts)
  * - Duration string: e.g., '10m', '1h', '30s' - container sleeps after this period of inactivity
- * 
- * To reduce costs at the expense of cold start latency, set SANDBOX_SLEEP_AFTER to a duration:
- *   npx wrangler secret put SANDBOX_SLEEP_AFTER
- *   # Enter: 10m (or 1h, 30m, etc.)
  */
 function buildSandboxOptions(env: MoltbotEnv): SandboxOptions {
   const sleepAfter = env.SANDBOX_SLEEP_AFTER?.toLowerCase() || 'never';
@@ -175,18 +135,16 @@ app.use('*', async (c, next) => {
   const options = buildSandboxOptions(c.env);
   const sandboxName = getSandboxNameForRequest(c);
   const user = c.get('user');
-  
-  // SAFETY: Use tiered routing only for migrated users when enabled
-  // All other users (including Jack until explicitly migrated) use legacy binding
+
   const sandboxBinding = user ? getSandboxForUser(c.env, user.id) : c.env.Sandbox;
   const sandbox = getSandbox(sandboxBinding, sandboxName, options);
-  
+
   if (user) {
     const instanceType = getInstanceTypeName(user.id);
     const isTiered = sandboxBinding !== c.env.Sandbox;
     console.log(`[SANDBOX] User ${user.id} using ${instanceType}${isTiered ? ' (tiered)' : ' (legacy)'}`);
   }
-  
+
   c.set('sandbox', sandbox);
   await next();
 });
@@ -197,16 +155,12 @@ app.use('*', async (c, next) => {
 
 // Login page - redirect to main app for SSO
 app.get('/login', async (c) => {
-  // Redirect to the main Captain App for login (shared SSO cookie on .captainapp.co.uk)
-  // After auth, it will redirect back with session tokens in the hash
   const returnUrl = encodeURIComponent('https://claw.captainapp.co.uk/auth/callback');
   return c.redirect(`https://captainapp.co.uk/auth?redirect=${returnUrl}`);
 });
 
 // Auth callback - handle session tokens from the hash (set by app.captainapp.co.uk)
 app.get('/auth/callback', async (c) => {
-  // The main app redirects back with tokens in the hash: #access_token=xxx&refresh_token=xxx...
-  // We need client-side JS to read the hash and set the cookie
   return c.html(`
     <!DOCTYPE html>
     <html>
@@ -225,21 +179,15 @@ app.get('/auth/callback', async (c) => {
         <p>Signing in...</p>
       </div>
       <script>
-        // Parse tokens from hash
         const hash = window.location.hash.substring(1);
         const params = new URLSearchParams(hash);
         const accessToken = params.get('access_token');
 
         if (accessToken) {
-          // Set cookie for server-side auth (shared across .captainapp.co.uk)
           const domain = '; domain=.captainapp.co.uk';
           document.cookie = 'sb-access-token=' + encodeURIComponent(accessToken) + domain + '; path=/; max-age=3600; SameSite=Lax; Secure';
-
-          // Redirect to main app
           window.location.replace('/');
         } else {
-          // No token in hash, check if SSO cookie exists and redirect
-          // The cookie might have been set by the main app already
           window.location.replace('/');
         }
       </script>
@@ -250,7 +198,6 @@ app.get('/auth/callback', async (c) => {
 
 // Logout - redirect to main app's logout
 app.get('/logout', async (c) => {
-  // Clear our cookie and redirect to login
   return c.html(`
     <!DOCTYPE html>
     <html>
@@ -258,7 +205,6 @@ app.get('/logout', async (c) => {
     <body>
       <p>Logging out...</p>
       <script>
-        // Clear cookies on .captainapp.co.uk domain
         document.cookie = 'sb-access-token=; domain=.captainapp.co.uk; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure';
         document.cookie = 'captainapp-sso-v1=; domain=.captainapp.co.uk; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure';
         window.location.href = '/login';
@@ -272,8 +218,6 @@ app.get('/logout', async (c) => {
 // PUBLIC ROUTES: No Cloudflare Access authentication required
 // =============================================================================
 
-// Mount public routes first (before auth middleware)
-// Includes: /sandbox-health, /logo.png, /logo-small.png, /api/status, /_admin/assets/*
 app.route('/', publicRoutes);
 
 // Debug bypass endpoint (requires secret header, bypasses CF Access)
@@ -293,9 +237,8 @@ app.get('/debug-bypass', async (c) => {
   const sandbox = c.get('sandbox');
 
   try {
-    // Check gateway status
     const processes = await sandbox.listProcesses();
-    const gatewayProcess = processes.find(p => p.command.includes('start-moltbot'));
+    const gatewayProcess = processes.find((p: any) => p.command.includes('start-moltbot'));
 
     return c.json({
       gateway: {
@@ -321,13 +264,12 @@ app.get('/debug-bypass', async (c) => {
 app.route('/cdp', cdp);
 
 // Mount Relay routes (bot-to-bot message relay, uses its own auth middleware)
-// Requires RELAY KV namespace to be configured
 app.route('/relay', relayRoutes);
 
 // =============================================================================
 // SUPER ADMIN ROUTES: Protected by X-Admin-Secret header
 // =============================================================================
-import { adminRouter } from './routes';
+
 app.route('/api/super', adminRouter);
 
 // =============================================================================
@@ -338,12 +280,10 @@ app.route('/api/super', adminRouter);
 app.use('*', async (c, next) => {
   const url = new URL(c.req.url);
 
-  // Skip validation for debug routes (they have their own enable check)
   if (url.pathname.startsWith('/debug')) {
     return next();
   }
 
-  // Skip validation in dev mode
   if (c.env.DEV_MODE === 'true') {
     return next();
   }
@@ -354,12 +294,10 @@ app.use('*', async (c, next) => {
 
     const acceptsHtml = c.req.header('Accept')?.includes('text/html');
     if (acceptsHtml) {
-      // Return a user-friendly HTML error page
       const html = configErrorHtml.replace('{{MISSING_VARS}}', missingVars.join(', '));
       return c.html(html, 503);
     }
 
-    // Return JSON error for API requests
     return c.json({
       error: 'Configuration error',
       message: 'Required environment variables are not configured',
@@ -373,13 +311,12 @@ app.use('*', async (c, next) => {
 
 // Middleware: Supabase authentication for protected routes
 app.use('*', async (c, next) => {
-  // Skip auth for public/auth endpoints and static assets
   const url = new URL(c.req.url);
   const publicPaths = ['/login', '/logout', '/auth/callback'];
   const isPublicPath = publicPaths.includes(url.pathname) ||
                        url.pathname.startsWith('/_admin/assets/') ||
                        url.pathname.startsWith('/debug/admin/') ||
-                       url.pathname.startsWith('/api/super/'); // TEMP: super admin debug endpoints
+                       url.pathname.startsWith('/api/super/');
   console.log(`[AUTH] Path: ${url.pathname}, isPublic: ${isPublicPath}`);
   if (isPublicPath) {
     return next();
@@ -395,13 +332,11 @@ app.use('*', async (c, next) => {
     }
   }
 
-  // Determine response type based on Accept header
   const acceptsHtml = c.req.header('Accept')?.includes('text/html');
   const middleware = createSupabaseAuthMiddleware({
     type: acceptsHtml ? 'html' : 'json',
   });
 
-  // Run auth middleware (sandbox is updated inside middleware before next() is called)
   return middleware(c, next);
 });
 
@@ -421,695 +356,61 @@ app.use('/debug/*', async (c, next) => {
 app.route('/debug', debug);
 
 // Emergency container reset endpoint (requires auth)
-// Uses the authenticated user's sandbox
-// Supports both GET and POST for easy mobile access
-app.get('/emergency-reset', async (c) => {
+async function handleEmergencyReset(c: any) {
   const sandbox = c.get('sandbox');
   const userId = c.get('user')?.id;
 
   console.log(`[RESET] Resetting sandbox for user: ${userId}`);
 
   try {
-    // Kill existing gateway processes only (not cleanup commands)
     const allProcesses = await sandbox.listProcesses();
     for (const proc of allProcesses) {
-      try { await proc.kill(); } catch (e) { /* ignore */ }
+      try { await proc.kill(); } catch (e) { console.warn('[RESET] Kill failed:', e); }
     }
     await new Promise(r => setTimeout(r, 2000));
 
-    // Start fresh gateway - it handles its own lock cleanup internally
-    const bootPromise = ensureMoltbotGateway(sandbox, c.env, userId).catch(() => {});
+    const bootPromise = ensureMoltbotGateway(sandbox, c.env, userId).catch(e => {
+      console.error('[RESET] Gateway restart failed:', e);
+    });
     c.executionCtx.waitUntil(bootPromise);
 
     return c.json({ success: true, message: 'Container reset initiated', sandbox: userId ? `openclaw-${userId}` : 'moltbot' });
   } catch (error) {
     return c.json({ error: String(error) }, 500);
   }
-});
-
-app.post('/emergency-reset', async (c) => {
-  const sandbox = c.get('sandbox');
-  const userId = c.get('user')?.id;
-
-  console.log(`[RESET] Resetting sandbox for user: ${userId}`);
-
-  try {
-    // Kill existing gateway processes only (not cleanup commands)
-    const allProcesses = await sandbox.listProcesses();
-    for (const proc of allProcesses) {
-      try { await proc.kill(); } catch (e) { /* ignore */ }
-    }
-    await new Promise(r => setTimeout(r, 2000));
-
-    // Start fresh gateway - it handles its own lock cleanup internally
-    const bootPromise = ensureMoltbotGateway(sandbox, c.env, userId).catch(() => {});
-    c.executionCtx.waitUntil(bootPromise);
-
-    return c.json({ success: true, message: 'Container reset initiated', sandbox: userId ? `openclaw-${userId}` : 'moltbot' });
-  } catch (error) {
-    return c.json({ error: String(error) }, 500);
-  }
-});
+}
+app.get('/emergency-reset', handleEmergencyReset);
+app.post('/emergency-reset', handleEmergencyReset);
 
 // =============================================================================
 // CATCH-ALL: Proxy to Moltbot gateway
 // =============================================================================
 
-app.all('*', async (c) => {
-  const sandbox = c.get('sandbox');
-  const user = c.get('user');
-  const request = c.req.raw;
-  const url = new URL(request.url);
-
-  console.log('[PROXY] Handling request:', url.pathname);
-
-  // Determine request type
-  const isWebSocketRequest = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
-  const acceptsHtml = request.headers.get('Accept')?.includes('text/html');
-
-  // Check if gateway is already running
-  const existingProcess = await findExistingMoltbotProcess(sandbox);
-  const isGatewayReady = existingProcess !== null && existingProcess.status === 'running';
-
-  // For browser requests (non-WebSocket, non-API), show loading page if gateway isn't ready
-  if (!isGatewayReady && !isWebSocketRequest && acceptsHtml) {
-    console.log('[PROXY] Gateway not ready, serving loading page');
-
-    // Start the gateway in the background (don't await) - pass user ID for per-user token
-    c.executionCtx.waitUntil(
-      ensureMoltbotGateway(sandbox, c.env, user?.id).catch((err: Error) => {
-        console.error('[PROXY] Background gateway start failed:', err);
-      })
-    );
-
-    // Return the loading page immediately, with user info injected
-    const userEmail = user?.email || 'User';
-    const loadingPage = loadingPageHtml.replace('{{USER_EMAIL}}', userEmail);
-    return c.html(loadingPage);
-  }
-
-  // Ensure moltbot is running (this will wait for startup) - pass user ID for per-user token
-  try {
-    await ensureMoltbotGateway(sandbox, c.env, user?.id);
-  } catch (error) {
-    console.error('[PROXY] Failed to start Moltbot:', error);
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-
-    let hint = 'Check worker logs with: wrangler tail';
-    if (!c.env.ANTHROPIC_API_KEY) {
-      hint = 'ANTHROPIC_API_KEY is not set. Run: wrangler secret put ANTHROPIC_API_KEY';
-    } else if (errorMessage.includes('heap out of memory') || errorMessage.includes('OOM')) {
-      hint = 'Gateway ran out of memory. Try again or check for memory leaks.';
-    }
-
-    return c.json({
-      error: 'Moltbot gateway failed to start',
-      details: errorMessage,
-      hint,
-    }, 503);
-  }
-
-  // Proxy to Moltbot with WebSocket message interception
-  if (isWebSocketRequest) {
-    const debugLogs = c.env.DEBUG_ROUTES === 'true';
-    const redactedSearch = redactSensitiveParams(url);
-
-    console.log('[WS] Proxying WebSocket connection to Moltbot');
-    if (debugLogs) {
-      console.log('[WS] URL:', url.pathname + redactedSearch);
-    }
-
-    // Inject gateway token for container auth
-    // Use per-user derived token if user is authenticated
-    let wsUrl = new URL(request.url);
-    let gatewayToken: string | undefined;
-    const masterToken = getGatewayMasterToken(c.env);
-    if (user && masterToken) {
-      gatewayToken = await deriveUserGatewayToken(masterToken, user.id);
-      console.log(`[WS] Using per-user derived token for user ${user.id.slice(0, 8)}...`);
-    } else {
-      gatewayToken = masterToken;
-    }
-
-    // Add token to URL and as header (container might not see URL params)
-    if (gatewayToken) {
-      wsUrl.searchParams.set('token', gatewayToken);
-      if (debugLogs) {
-        console.log('[WS] Set gateway token in WebSocket URL');
-      }
-    }
-
-    // Create request with token in header as well
-    const wsHeaders = new Headers(request.headers);
-    if (gatewayToken) {
-      wsHeaders.set('X-Gateway-Token', gatewayToken);
-      wsHeaders.set('Authorization', `Bearer ${gatewayToken}`);
-    }
-    const wsRequest = new Request(wsUrl.toString(), {
-      method: request.method,
-      headers: wsHeaders,
-    });
-
-    // Get WebSocket connection to the container
-    const containerResponse = await sandbox.wsConnect(wsRequest, MOLTBOT_PORT);
-    console.log('[WS] wsConnect response status:', containerResponse.status);
-
-    // Get the container-side WebSocket
-    const containerWs = containerResponse.webSocket;
-    if (!containerWs) {
-      console.error('[WS] No WebSocket in container response - falling back to direct proxy');
-      return containerResponse;
-    }
-
-    if (debugLogs) {
-      console.log('[WS] Got container WebSocket, setting up interception');
-    }
-
-    // Create a WebSocket pair for the client
-    const [clientWs, serverWs] = Object.values(new WebSocketPair());
-
-    // Accept both WebSockets
-    serverWs.accept();
-    containerWs.accept();
-
-    if (debugLogs) {
-      console.log('[WS] Both WebSockets accepted');
-      console.log('[WS] containerWs.readyState:', containerWs.readyState);
-      console.log('[WS] serverWs.readyState:', serverWs.readyState);
-    }
-
-    // Relay messages from client to container, injecting token into connect credentials
-    serverWs.addEventListener('message', (event) => {
-      if (debugLogs) {
-        console.log('[WS] Client -> Container:', typeof event.data, typeof event.data === 'string' ? event.data.slice(0, 200) : '(binary)');
-      }
-      let data = event.data;
-
-      // Inject gateway token into connect message auth field
-      // Gateway expects: params.auth.token (see gateway/auth.js and message-handler.js)
-      // IMPORTANT: Remove device object to skip device signature validation
-      // When hasTokenAuth is true AND no device object, gateway allows connection (line 238-275 of message-handler.js)
-      if (typeof data === 'string' && gatewayToken) {
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed.method === 'connect' && parsed.params) {
-            if (debugLogs) {
-              console.log('[WS] Injecting gateway token into connect auth');
-            }
-            parsed.params.auth = parsed.params.auth || {};
-            parsed.params.auth.token = gatewayToken;
-            delete parsed.params.device;
-            delete parsed.params.credentials;
-            if (parsed.params.client?.id === 'clawdbot-control-ui' || parsed.params.client?.id === 'control-ui') {
-              if (debugLogs) {
-                console.log('[WS] Changing client ID from', parsed.params.client.id, 'to webchat for proxy compatibility');
-              }
-              parsed.params.client.id = 'webchat';
-            }
-            data = JSON.stringify(parsed);
-            if (debugLogs) {
-              console.log('[WS] Modified connect params (device removed):', JSON.stringify(parsed.params).slice(0, 300));
-            }
-          }
-        } catch (e) {
-          // Not JSON, pass through as-is
-        }
-      }
-
-      if (containerWs.readyState === WebSocket.OPEN) {
-        containerWs.send(data);
-      } else if (debugLogs) {
-        console.log('[WS] Container not open, readyState:', containerWs.readyState);
-      }
-    });
-
-    // Relay messages from container to client, with error transformation
-    containerWs.addEventListener('message', (event) => {
-      if (debugLogs) {
-        console.log('[WS] Container -> Client (raw):', typeof event.data, typeof event.data === 'string' ? event.data.slice(0, 500) : '(binary)');
-      }
-      let data = event.data;
-
-      // Try to intercept and transform error messages
-      if (typeof data === 'string') {
-        try {
-          const parsed = JSON.parse(data);
-          if (debugLogs) {
-            console.log('[WS] Parsed JSON, has error.message:', !!parsed.error?.message);
-          }
-          if (parsed.error?.message) {
-            if (debugLogs) {
-              console.log('[WS] Original error.message:', parsed.error.message);
-            }
-            parsed.error.message = transformErrorMessage(parsed.error.message, url.host);
-            if (debugLogs) {
-              console.log('[WS] Transformed error.message:', parsed.error.message);
-            }
-            data = JSON.stringify(parsed);
-          }
-        } catch (e) {
-          if (debugLogs) {
-            console.log('[WS] Not JSON or parse error:', e);
-          }
-        }
-      }
-
-      if (serverWs.readyState === WebSocket.OPEN) {
-        serverWs.send(data);
-      } else if (debugLogs) {
-        console.log('[WS] Server not open, readyState:', serverWs.readyState);
-      }
-    });
-
-    // Handle close events
-    serverWs.addEventListener('close', (event) => {
-      if (debugLogs) {
-        console.log('[WS] Client closed:', event.code, event.reason);
-      }
-      containerWs.close(event.code, event.reason);
-    });
-
-    containerWs.addEventListener('close', (event) => {
-      if (debugLogs) {
-        console.log('[WS] Container closed:', event.code, event.reason);
-      }
-      // Transform the close reason (truncate to 123 bytes max for WebSocket spec)
-      let reason = transformErrorMessage(event.reason, url.host);
-      if (reason.length > 123) {
-        reason = reason.slice(0, 120) + '...';
-      }
-      if (debugLogs) {
-        console.log('[WS] Transformed close reason:', reason);
-      }
-      serverWs.close(event.code, reason);
-    });
-
-    // Handle errors
-    serverWs.addEventListener('error', (event) => {
-      console.error('[WS] Client error:', event);
-      containerWs.close(1011, 'Client error');
-    });
-
-    containerWs.addEventListener('error', (event) => {
-      console.error('[WS] Container error:', event);
-      serverWs.close(1011, 'Container error');
-    });
-
-    if (debugLogs) {
-      console.log('[WS] Returning intercepted WebSocket response');
-    }
-    return new Response(null, {
-      status: 101,
-      webSocket: clientWs,
-    });
-  }
-
-  console.log('[HTTP] Proxying:', url.pathname + url.search);
-  const httpResponse = await sandbox.containerFetch(request, MOLTBOT_PORT);
-  console.log('[HTTP] Response status:', httpResponse.status);
-
-  // Add debug header to verify worker handled the request
-  const newHeaders = new Headers(httpResponse.headers);
-  newHeaders.set('X-Worker-Debug', 'proxy-to-moltbot');
-  newHeaders.set('X-Debug-Path', url.pathname);
-
-  // For HTML responses, inject gateway token and logout button
-  const contentType = httpResponse.headers.get('content-type') || '';
-  if (contentType.includes('text/html') && user) {
-    const html = await httpResponse.text();
-
-    // Derive the gateway token for this user
-    let gatewayToken = '';
-    const masterToken = getGatewayMasterToken(c.env);
-    if (masterToken) {
-      gatewayToken = await deriveUserGatewayToken(masterToken, user.id);
-    }
-
-    const injectedScript = `
-<script>
-// Gateway token for WebSocket authentication - store in localStorage for Control UI
-window.__GATEWAY_TOKEN__ = '${gatewayToken}';
-if ('${gatewayToken}') {
-  // Store token in localStorage where Control UI looks for it
-  try {
-    localStorage.setItem('openclaw-gateway-token', '${gatewayToken}');
-    localStorage.setItem('gateway-token', '${gatewayToken}');
-    // Also try the Control UI's config storage format (both old and new keys for compat)
-    var config = JSON.parse(localStorage.getItem('openclaw-control-ui-config') || localStorage.getItem('clawdbot-control-ui-config') || '{}');
-    config.gatewayToken = '${gatewayToken}';
-    config.token = '${gatewayToken}';
-    localStorage.setItem('openclaw-control-ui-config', JSON.stringify(config));
-    localStorage.setItem('clawdbot-control-ui-config', JSON.stringify(config)); // legacy compat
-    console.log('[Injected] Set gateway token in localStorage');
-  } catch(e) { console.error('[Injected] localStorage error:', e); }
-}
-
-// Logout button
-(function() {
-  var btn = document.createElement('a');
-  btn.href = '/logout';
-  btn.innerHTML = 'Logout (${user.email || 'User'})';
-  btn.style.cssText = 'position:fixed;top:10px;right:10px;z-index:99999;background:#1a1a2e;color:#f97316;padding:8px 16px;border-radius:6px;text-decoration:none;font-family:system-ui,sans-serif;font-size:13px;border:1px solid #f97316;';
-  btn.onmouseover = function() { this.style.background='#f97316'; this.style.color='#fff'; };
-  btn.onmouseout = function() { this.style.background='#1a1a2e'; this.style.color='#f97316'; };
-  document.addEventListener('DOMContentLoaded', function() { document.body.appendChild(btn); });
-  if (document.body) document.body.appendChild(btn);
-})();
-
-// Emergency reset button
-(function() {
-  var btn = document.createElement('button');
-  btn.innerHTML = 'Reset';
-  btn.title = 'Emergency container reset';
-  btn.style.cssText = 'position:fixed;top:10px;right:200px;z-index:99999;background:#1a1a2e;color:#ef4444;padding:8px 16px;border-radius:6px;font-family:system-ui,sans-serif;font-size:13px;border:1px solid #ef4444;cursor:pointer;';
-  btn.onmouseover = function() { this.style.background='#ef4444'; this.style.color='#fff'; };
-  btn.onmouseout = function() { this.style.background='#1a1a2e'; this.style.color='#ef4444'; };
-  btn.onclick = async function() {
-    if (!confirm('Reset container? This will restart the gateway.')) return;
-    btn.disabled = true;
-    btn.innerHTML = 'Resetting...';
-    try {
-      var res = await fetch('/emergency-reset');
-      var data = await res.json();
-      if (data.success) {
-        btn.innerHTML = 'Done!';
-        setTimeout(function() { window.location.reload(); }, 2000);
-      } else {
-        alert('Reset failed: ' + (data.error || 'Unknown error'));
-        btn.disabled = false;
-        btn.innerHTML = 'Reset';
-      }
-    } catch(e) {
-      alert('Reset failed: ' + e.message);
-      btn.disabled = false;
-      btn.innerHTML = 'Reset';
-    }
-  };
-  document.addEventListener('DOMContentLoaded', function() { document.body.appendChild(btn); });
-  if (document.body) document.body.appendChild(btn);
-})();
-
-// Patch WebSocket to auto-add token to gateway connections
-(function() {
-  var OriginalWebSocket = window.WebSocket;
-  window.WebSocket = function(url, protocols) {
-    var token = window.__GATEWAY_TOKEN__;
-    if (token && url && (url.includes('://') || url.startsWith('/'))) {
-      try {
-        var wsUrl = new URL(url, window.location.origin);
-        // Only add token if not already present and it's a local connection
-        if (!wsUrl.searchParams.has('token') && wsUrl.host === window.location.host) {
-          wsUrl.searchParams.set('token', token);
-          url = wsUrl.toString();
-          console.log('[WS-Patch] Added token to WebSocket URL');
-        }
-      } catch(e) {
-        console.error('[WS-Patch] Error:', e);
-      }
-    }
-    return new OriginalWebSocket(url, protocols);
-  };
-  window.WebSocket.prototype = OriginalWebSocket.prototype;
-  window.WebSocket.CONNECTING = OriginalWebSocket.CONNECTING;
-  window.WebSocket.OPEN = OriginalWebSocket.OPEN;
-  window.WebSocket.CLOSING = OriginalWebSocket.CLOSING;
-  window.WebSocket.CLOSED = OriginalWebSocket.CLOSED;
-})();
-</script>`;
-    // Inject before </head> or </body> or at end
-    let modifiedHtml = html;
-    if (html.includes('</head>')) {
-      modifiedHtml = html.replace('</head>', injectedScript + '</head>');
-    } else if (html.includes('</body>')) {
-      modifiedHtml = html.replace('</body>', injectedScript + '</body>');
-    } else {
-      modifiedHtml = html + injectedScript;
-    }
-    newHeaders.delete('content-length');
-    return new Response(modifiedHtml, {
-      status: httpResponse.status,
-      statusText: httpResponse.statusText,
-      headers: newHeaders,
-    });
-  }
-
-  return new Response(httpResponse.body, {
-    status: httpResponse.status,
-    statusText: httpResponse.statusText,
-    headers: newHeaders,
-  });
-});
-
-/**
- * Scheduled handler for cron triggers.
- * Runs health checks and syncs all user containers to R2.
- */
-async function scheduled(
-  _event: ScheduledEvent,
-  env: MoltbotEnv,
-  _ctx: ExecutionContext
-): Promise<void> {
-  console.log('[cron] Starting health checks and backup sync...');
-
-  // Use the hardcoded user registry — it's the single source of truth
-  const { getActiveUserIds } = await import('./lib/user-registry');
-  const userIds = new Set<string>(getActiveUserIds());
-
-  console.log(`[cron] Found ${userIds.size} users to check`);
-
-  const options = buildSandboxOptions(env);
-
-  // Stats
-  let healthyCount = 0;
-  let unhealthyCount = 0;
-  let restartCount = 0;
-  let syncSuccessCount = 0;
-  let syncFailCount = 0;
-  let skippedCount = 0;
-  const issues: Array<{ userId: string; type: string; error: string }> = [];
-
-  // Process each user's sandbox
-  for (const userId of userIds) {
-    const sandboxName = `openclaw-${userId}`;
-    const r2Prefix = `users/${userId}`;
-
-    try {
-      // Use tiered routing for sandbox binding
-      const sandboxBinding = getSandboxForUser(env, userId);
-      const tier = getTierForUser(userId);
-      const sandbox = getSandbox(sandboxBinding, sandboxName, options);
-
-      const bindingName = sandboxBinding === env.SandboxStandard3 ? 'standard-3' :
-                          sandboxBinding === env.SandboxStandard2 ? 'standard-2' :
-                          sandboxBinding === env.SandboxStandard1 ? 'standard-1' : 'legacy';
-      console.log(`[cron] Processing user ${userId.slice(0, 8)} on tier ${tier} (binding: ${bindingName})`);
-
-      // Check if gateway is running
-      const processes = await sandbox.listProcesses();
-      const gatewayRunning = processes.some((p: any) =>
-        (p.command?.includes('openclaw gateway') || p.command?.includes('openclaw-gateway') || p.command?.includes('start-moltbot.sh')) &&
-        p.status === 'running'
-      );
-      
-      if (!gatewayRunning) {
-        // Gateway not running — check if user has a backup (meaning they've been set up)
-        const backupHead = await env.MOLTBOT_BUCKET.head(`users/${userId}/backup.tar.gz`);
-        if (backupHead && backupHead.size > 200) {
-          console.log(`[cron] Auto-starting gateway for ${sandboxName} — has ${Math.round(backupHead.size / 1024)}KB backup but no gateway`);
-          try {
-            await ensureMoltbotGateway(sandbox, env, userId);
-            console.log(`[cron] Auto-started gateway for ${sandboxName}`);
-            restartCount++;
-          } catch (startErr) {
-            console.error(`[cron] Failed to auto-start ${sandboxName}:`, startErr);
-            issues.push({ userId, type: 'auto_start_failed', error: startErr instanceof Error ? startErr.message : 'Unknown error' });
-            skippedCount++;
-            continue;
-          }
-        } else {
-          console.log(`[cron] Skipping ${sandboxName} — no gateway and no backup`);
-          skippedCount++;
-          continue;
-        }
-      }
-
-      // Run health check
-      const healthResult = await checkHealth(sandbox, userId, HEALTH_CHECK_CONFIG);
-
-      // Log health event
-      logHealthEvent(userId, healthResult.healthy, {
-        consecutiveFailures: healthResult.consecutiveFailures,
-        processRunning: healthResult.checks.processRunning,
-        portReachable: healthResult.checks.portReachable,
-        uptimeSeconds: healthResult.uptimeSeconds,
-      });
-
-      if (healthResult.healthy) {
-        healthyCount++;
-        console.log(`[cron] Health OK: ${sandboxName} (uptime: ${healthResult.uptimeSeconds}s)`);
-      } else {
-        unhealthyCount++;
-        console.warn(`[cron] Health FAIL: ${sandboxName} - failures: ${healthResult.consecutiveFailures}, checks: ${JSON.stringify(healthResult.checks)}`);
-
-        // Check if we should auto-restart
-        if (shouldRestart(userId, HEALTH_CHECK_CONFIG)) {
-          console.log(`[cron] Auto-restarting ${sandboxName} after ${healthResult.consecutiveFailures} consecutive failures`);
-          issues.push({ userId, type: 'auto_restart', error: `${healthResult.consecutiveFailures} consecutive health check failures` });
-
-          // Record issue to D1
-          if (env.PLATFORM_DB) {
-            await createIssue(env.PLATFORM_DB, {
-              type: 'health_failure',
-              severity: 'high',
-              userId,
-              message: `Auto-restart triggered after ${healthResult.consecutiveFailures} consecutive health check failures`,
-              details: {
-                checks: healthResult.checks,
-                uptimeSeconds: healthResult.uptimeSeconds,
-              },
-            });
-          }
-
-          try {
-            // Record restart for circuit breaker tracking
-            recordRestartForCircuitBreaker(userId);
-
-            // Use restartContainer which includes pre-shutdown sync (when enabled)
-            const restartResult = await restartContainer(sandbox, env, userId);
-
-            if (restartResult.success) {
-              recordRestart(userId);
-              restartCount++;
-              logRestartEvent(userId, true, 'auto_health_failure', {
-                previousFailures: healthResult.consecutiveFailures,
-              });
-              console.log(`[cron] Auto-restart initiated for ${sandboxName}${restartResult.syncResult?.success ? ' with pre-shutdown sync' : ''}`);
-            } else {
-              throw new Error(restartResult.message);
-            }
-          } catch (restartErr) {
-            const errorMsg = restartErr instanceof Error ? restartErr.message : 'Unknown error';
-            console.error(`[cron] Failed to restart ${sandboxName}:`, restartErr);
-            issues.push({ userId, type: 'restart_failed', error: errorMsg });
-            logRestartEvent(userId, false, 'auto_health_failure', { previousFailures: healthResult.consecutiveFailures });
-
-            // Record restart failure to D1
-            if (env.PLATFORM_DB) {
-              await createIssue(env.PLATFORM_DB, {
-                type: 'restart',
-                severity: 'critical',
-                userId,
-                message: `Auto-restart failed: ${errorMsg}`,
-                details: { previousFailures: healthResult.consecutiveFailures },
-              });
-            }
-          }
-        }
-      }
-
-      // Run sync (only if sandbox is active and healthy or just restarted)
-      // If CRITICAL_FILE_PRIORITY is enabled, sync critical files first
-      let criticalSyncResult: { success: boolean; durationMs?: number } | undefined;
-
-      if (isBackupFeatureEnabled('CRITICAL_FILE_PRIORITY')) {
-        criticalSyncResult = await syncCriticalFilesToR2(sandbox, env, { r2Prefix });
-        if (criticalSyncResult.success) {
-          console.log(`[cron] Critical files synced for ${sandboxName} in ${criticalSyncResult.durationMs}ms`);
-        } else {
-          console.warn(`[cron] Critical file sync failed for ${sandboxName}:`, criticalSyncResult);
-        }
-      }
-
-      // Run full sync
-      const syncResult = await syncToR2(sandbox, env, { r2Prefix });
-
-      // Log sync event
-      logSyncEvent(userId, syncResult.success, syncResult.durationMs || 0, {
-        fileCount: syncResult.fileCount,
-        error: syncResult.error,
-        syncId: syncResult.syncId,
-      });
-
-      if (syncResult.success) {
-        console.log(`[cron] Synced ${sandboxName}: ${syncResult.fileCount} files in ${syncResult.durationMs}ms`);
-        syncSuccessCount++;
-      } else {
-        console.error(`[cron] Sync failed for ${sandboxName}: ${syncResult.error}`);
-        issues.push({ userId, type: 'sync_failed', error: syncResult.error || 'Unknown error' });
-        syncFailCount++;
-
-        // Record sync failure to D1 if consecutive failures reach threshold
-        const consecutiveFailures = getConsecutiveSyncFailures(r2Prefix);
-        if (consecutiveFailures >= 3 && env.PLATFORM_DB) {
-          console.warn(`[cron] Recording sync failure to D1: ${consecutiveFailures} consecutive failures for ${userId}`);
-          await createIssue(env.PLATFORM_DB, {
-            type: 'sync_failure',
-            severity: 'medium',
-            userId,
-            message: `${consecutiveFailures} consecutive sync failures`,
-            details: {
-              rsyncExitCode: syncResult.rsyncExitCode,
-              syncId: syncResult.syncId,
-              error: syncResult.error,
-              details: syncResult.details,
-            },
-          });
-        }
-      }
-
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : 'Unknown error';
-      console.error(`[cron] Error processing ${sandboxName}:`, err);
-      issues.push({ userId, type: 'cron_error', error: errorMsg });
-    }
-  }
-
-  // Run rolling 20-minute backup (idempotent - only runs once per 20-min slot)
-  try {
-    const rollingResult = await createRollingBackup(env);
-    if (rollingResult.skipped) {
-      console.log(`[cron] Rolling backup: skipped (${rollingResult.skipReason})`);
-    } else if (rollingResult.success) {
-      console.log(`[cron] Rolling backup: ${rollingResult.usersBackedUp} users, ${rollingResult.filesBackedUp} files at ${rollingResult.date}`);
-    } else {
-      console.error(`[cron] Rolling backup failed: ${rollingResult.error}`);
-    }
-  } catch (err) {
-    console.error(`[cron] Rolling backup error:`, err);
-  }
-
-  // Run daily backup (idempotent - only runs once per day)
-  try {
-    const backupResult = await createDailyBackup(env);
-    if (backupResult.skipped) {
-      console.log(`[cron] Daily backup: skipped (${backupResult.skipReason})`);
-    } else if (backupResult.success) {
-      console.log(`[cron] Daily backup: ${backupResult.usersBackedUp} users, ${backupResult.filesBackedUp} files`);
-    } else {
-      console.error(`[cron] Daily backup failed: ${backupResult.error}`);
-    }
-  } catch (err) {
-    console.error(`[cron] Daily backup error:`, err);
-  }
-
-  // Log summary
-  console.log(`[cron] Complete - Health: ${healthyCount} healthy, ${unhealthyCount} unhealthy, ${restartCount} restarted`);
-  console.log(`[cron] Complete - Sync: ${syncSuccessCount} succeeded, ${syncFailCount} failed, ${skippedCount} skipped`);
-  if (issues.length > 0) {
-    console.error(`[cron] Issues:`, JSON.stringify(issues.slice(0, 10)));
-  }
-}
+app.all('*', proxyHandler);
+
+// =============================================================================
+// DURABLE OBJECT EXPORTS
+// =============================================================================
 
 // Export Durable Object classes for tiered instance types
 export { Sandbox } from '@cloudflare/sandbox';
 
-// Re-export Sandbox as tiered class names for binding compatibility
-// All tier classes use the same underlying implementation
+// Legacy exports (for migration compatibility — all referenced in wrangler.jsonc migration tags)
 export class SandboxStandard1 extends Sandbox {}
 export class SandboxStandard2 extends Sandbox {}
 export class SandboxStandard3 extends Sandbox {}
+export class SmartboxSmall extends Sandbox {}
+export class SmartboxMedium extends Sandbox {}
+export class SmartboxLarge extends Sandbox {}
+
+// Clean tier names (v6)
+// Small=1vCPU/1GB, Medium=2vCPU/2GB, Large=4vCPU/4GB
+export class Small extends Sandbox {}
+export class Medium extends Sandbox {}
+export class Large extends Sandbox {}
 
 export default {
   fetch: app.fetch,
-  scheduled,
+  scheduled: (event: ScheduledEvent, env: MoltbotEnv, ctx: ExecutionContext) =>
+    scheduledHandler(event, env, ctx, async (req, e) => app.fetch(req, e)),
 };

@@ -271,6 +271,11 @@ EOFNODE
 AGENT_DIR="/root/.openclaw/agents/main/agent"
 mkdir -p "$AGENT_DIR"
 
+# Synthesize CAPTAINAPP_API_KEY from per-deployment key + user id.
+if [ -n "$CAPTAINAPP_USER_KEY" ] && [ -n "$OPENCLAW_USER_ID" ]; then
+  export CAPTAINAPP_API_KEY="$OPENCLAW_USER_ID:$CAPTAINAPP_USER_KEY"
+fi
+
 if [ -n "$CAPTAINAPP_API_KEY" ]; then
     echo "Creating auth profile for CaptainApp provider..."
     node -e "

@@ -376,11 +376,24 @@ adminRouter.get('/users/:id/state/v2', async (c) => {
 adminRouter.get('/state/dashboard', async (c) => {
   const startTime = Date.now();
   const userIds = DEFAULT_USER_REGISTRY.map(u => u.userId);
-  
+
+  const withTimeout = async <T>(p: Promise<T>, ms: number, label: string): Promise<T> => {
+    let t: any;
+    const timeout = new Promise<T>((_, reject) => {
+      t = setTimeout(() => reject(new Error(`timeout after ${ms}ms: ${label}`)), ms);
+    });
+    try {
+      return await Promise.race([p, timeout]);
+    } finally {
+      clearTimeout(t);
+    }
+  };
+
+  // IMPORTANT: never let one wedged Sandbox DO stall the entire dashboard.
   const checks = await Promise.all(
     userIds.map(async (userId) => {
       try {
-        return await getLiveState(userId, c.env);
+        return await withTimeout(getLiveState(userId, c.env), 8000, `getLiveState(${userId.slice(0, 8)})`);
       } catch (error) {
         return {
           state: CONTAINER_STATES.ERROR,
@@ -389,15 +402,15 @@ adminRouter.get('/state/dashboard', async (c) => {
           processCount: 0,
           gatewayHealthy: null,
           checkedAt: new Date().toISOString(),
-          latencyMs: 0,
+          latencyMs: Date.now() - startTime,
           error: error instanceof Error ? error.message : 'Failed to check',
         };
       }
     })
   );
-  
+
   const totalLatency = Date.now() - startTime;
-  
+
   return c.json({
     users: checks.map(c => ({
       ...c,

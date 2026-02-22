@@ -118,6 +118,23 @@ if (nativeFiles.length > 0) {
       }
     }
 
+    // Ensure CaptainApp requests include a normal User-Agent.
+    // Without this, Cloudflare may return error 1010 for bot-like clients.
+    if (!content.includes('"User-Agent"') && content.includes('X-CaptainApp-User-Key')) {
+      // Non-minified
+      content = content.replace(
+        /("X-CaptainApp-User-Key"\s*:\s*[^\n\r}]+)(\s*[\n\r]?\s*})/,
+        `$1,\n\t\t\t"User-Agent": "OpenClawSandbox/2026.2.4"$2`
+      );
+      // Minified (fallback)
+      content = content.replace(
+        /("X-CaptainApp-User-Key"\s*:\s*[^}]+)(})/,
+        `$1,"User-Agent":"OpenClawSandbox/2026.2.4"$2`
+      );
+      patched = true;
+      console.log('  Applied: User-Agent header injection');
+    }
+
     // Fix model ID: remove provider prefix from CAPTAINAPP_DEFAULT_MODEL_ID
     // The convention is model IDs don't include the provider prefix (e.g., "kimi-k2.5" not "captainapp/kimi-k2.5")
     // Without this fix, ModelRegistry.find("captainapp", "kimi-k2.5") won't match id "captainapp/kimi-k2.5"

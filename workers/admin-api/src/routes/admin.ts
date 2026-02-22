@@ -663,8 +663,9 @@ adminRouter.post('/users/:id/message', async (c) => {
     const sessionFlag = sessionKey ? `--session-id '${sessionKey}'` : "--agent 'main'";
 
     // Keep this tight: if the agent can't respond quickly, treat as failure and don't backlog.
-    // Force a known-good model to avoid per-user custom aliases breaking the sandbox runtime.
-    const cmd = `openclaw agent ${sessionFlag} --model 'openai-codex/gpt-5.2' --message '${escapedMessage}' 2>&1`;
+    // NOTE: sandbox OpenClaw is currently 2026.2.4; it does NOT support --model.
+    // Keep invocation minimal and force agent selection so it doesn't error.
+    const cmd = `openclaw agent ${sessionFlag} --thinking minimal --message '${escapedMessage}' 2>&1`;
     const result = await sandbox.exec(cmd, { timeout: 12000 });
 
     const payload = {

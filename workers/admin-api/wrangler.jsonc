@@ -45,7 +45,7 @@
     {
       "class_name": "Sandbox",
       "image": "../../Dockerfile",
-      "instance_type": "standard-1",
+      "instance_type": "standard", // was standard-1 (invalid for current wrangler)
       "max_instances": 1
     }
   ],

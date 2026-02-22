@@ -13,7 +13,7 @@
   "services": [
     {
       "binding": "ADMIN_API",
-      "service": "moltbot-sandbox"
+      "service": "moltworker-admin-api"
     },
     {
       "binding": "CONTAINER_GATEWAY",

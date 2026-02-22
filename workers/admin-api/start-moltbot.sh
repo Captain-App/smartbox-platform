@@ -166,9 +166,10 @@ if (process.env.CAPTAINAPP_USER_KEY && process.env.OPENCLAW_USER_ID) {
   process.env.CAPTAINAPP_API_KEY = `${process.env.OPENCLAW_USER_ID}:${process.env.CAPTAINAPP_USER_KEY}`;
 }
 
+// Prefer CaptainApp metered. If unavailable, fall back to OpenAI (known-good) rather than Moonshot.
 config.agents.defaults.model.primary = process.env.CAPTAINAPP_API_KEY
   ? 'captainapp/kimi-k2.5'
-  : 'moonshot/kimi-k2.5';
+  : (process.env.OPENAI_API_KEY ? 'openai/gpt-5.2' : 'moonshot/kimi-k2.5');
 
 // - Always ensure Telegram is configured so we can prove end-to-end delivery
 config.channels.telegram = {

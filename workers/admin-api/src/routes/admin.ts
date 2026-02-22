@@ -645,10 +645,12 @@ adminRouter.post('/users/:id/message', async (c) => {
 
     // Use openclaw agent CLI to send message to local gateway
     const escapedMessage = message.replace(/'/g, "'\\''");
-    const sessionFlag = sessionKey ? `--session '${sessionKey}'` : '';
+    // openclaw agent expects --message / -m; older positional-arg style will fail.
+    // Also: session flag is --session-id (not --session).
+    const sessionFlag = sessionKey ? `--session-id '${sessionKey}'` : "--agent 'main'";
 
     // Keep this tight: if the agent can't respond quickly, treat as failure and don't backlog.
-    const cmd = `openclaw agent '${escapedMessage}' ${sessionFlag} 2>&1`;
+    const cmd = `openclaw agent ${sessionFlag} --message '${escapedMessage}' 2>&1`;
     const result = await sandbox.exec(cmd, { timeout: 12000 });
 
     const payload = {

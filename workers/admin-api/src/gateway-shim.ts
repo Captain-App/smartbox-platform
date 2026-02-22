@@ -107,24 +107,26 @@ export async function ensureMoltbotGateway(sandbox: any, env: any, userId: strin
     console.warn('[gateway-shim] Failed to load config from R2:', err);
   }
 
-  // Build env vars
-  const startEnv: Record<string, string> = { OPENCLAW_USER_ID: userId };
-  if (injectedConfigB64) startEnv.OPENCLAW_CONFIG_B64 = injectedConfigB64;
-  // Pass through CaptainApp metered provider user-key if available.
-  // The sandbox boot script will combine it with OPENCLAW_USER_ID to form
-  // CAPTAINAPP_API_KEY="<userId>:<userKey>".
-  if (env.CAPTAINAPP_USER_KEY) startEnv.CAPTAINAPP_USER_KEY = String(env.CAPTAINAPP_USER_KEY);
-  
+  // NOTE: @cloudflare/sandbox startProcess env injection is unreliable; pass env via shell exports.
+  const exports: string[] = [];
+  const esc = (s: string) => s.replace(/'/g, `'"'"'`);
+
+  exports.push(`export OPENCLAW_USER_ID='${esc(userId)}'`);
+  if (injectedConfigB64) exports.push(`export OPENCLAW_CONFIG_B64='${esc(injectedConfigB64)}'`);
+  if (env.CAPTAINAPP_USER_KEY) exports.push(`export CAPTAINAPP_USER_KEY='${esc(String(env.CAPTAINAPP_USER_KEY))}'`);
+
   // Derive per-user gateway token
   if (env.MOLTBOT_GATEWAY_MASTER_TOKEN) {
     const enc = new TextEncoder();
     const key = await crypto.subtle.importKey('raw', enc.encode(env.MOLTBOT_GATEWAY_MASTER_TOKEN), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
     const sig = await crypto.subtle.sign('HMAC', key, enc.encode(`gateway-token:${userId}`));
-    startEnv.OPENCLAW_GATEWAY_TOKEN = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+    const token = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+    exports.push(`export OPENCLAW_GATEWAY_TOKEN='${token}'`);
   }
 
   // Start via startup script (handles restore + config + gateway)
-  await sandbox.startProcess('/usr/local/bin/start-moltbot.sh', { env: startEnv });
+  const cmd = `sh -lc "${exports.join('; ')}; exec /usr/local/bin/start-moltbot.sh"`;
+  await sandbox.startProcess(cmd);
 
   // Wait for gateway to be ready
   const deadline = Date.now() + 30000;

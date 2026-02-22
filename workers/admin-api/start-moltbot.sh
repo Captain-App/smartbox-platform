@@ -139,6 +139,8 @@ config.gateway = config.gateway || {};
 // Gateway configuration
 config.gateway.port = 18789;
 config.gateway.mode = 'local';
+// IMPORTANT: bind to all interfaces so the Sandbox DO can reach it via containerFetch.
+config.gateway.bind = '0.0.0.0';
 config.gateway.trustedProxies = ['10.1.0.0'];
 
 // Set gateway token if provided - use token-only auth mode (no device pairing required)

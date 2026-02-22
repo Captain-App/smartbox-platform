@@ -31,6 +31,9 @@
     {
       "tag": "v2",
       "deleted_classes": ["SandboxStandard1", "SandboxStandard2", "SandboxStandard3"]
+    },
+    {
+      "tag": "v3"
     }
   ],
   

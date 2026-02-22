@@ -325,10 +325,10 @@ echo "Dev mode: ${OPENCLAW_DEV_MODE:-false}, Bind mode: $BIND_MODE"
 if [ -n "$OPENCLAW_GATEWAY_TOKEN" ]; then
     echo "Starting gateway with token auth..."
     # Run in background so we can health-check and exit non-zero on failure.
-    openclaw gateway --port 18789 --verbose --allow-unconfigured --bind "$BIND_MODE" --token "$OPENCLAW_GATEWAY_TOKEN" &
+    openclaw gateway run --port 18789 --verbose --allow-unconfigured --bind "$BIND_MODE" --token "$OPENCLAW_GATEWAY_TOKEN" &
 else
     echo "Starting gateway with device pairing (no token)..."
-    openclaw gateway --port 18789 --verbose --allow-unconfigured --bind "$BIND_MODE" &
+    openclaw gateway run --port 18789 --verbose --allow-unconfigured --bind "$BIND_MODE" &
 fi
 
 GATEWAY_PID=$!

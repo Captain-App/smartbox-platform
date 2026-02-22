@@ -17,7 +17,7 @@
         "name": "EXEC_RESULT_STORE"
       },
       {
-        "class_name": "Sandbox",
+        "class_name": "SandboxV4",
         "name": "Sandbox"
       }
     ]
@@ -34,6 +34,10 @@
     },
     {
       "tag": "v3"
+    },
+    {
+      "tag": "v4",
+      "new_sqlite_classes": ["SandboxV4"]
     }
   ],
   
@@ -46,9 +50,9 @@
   
   "containers": [
     {
-      "class_name": "Sandbox",
+      "class_name": "SandboxV4",
       "image": "../../Dockerfile",
-      "instance_type": "standard", // was standard-1 (invalid for current wrangler)
+      "instance_type": "standard-1",
       "max_instances": 1
     }
   ],

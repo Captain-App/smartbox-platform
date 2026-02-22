@@ -76,8 +76,8 @@ app.notFound((c) => {
 // Container Classes (required for container bindings)
 // =============================================================================
 
-// Re-export Sandbox from the SDK — container bindings need the real class
-export { Sandbox } from '@cloudflare/sandbox';
+// Re-export container/DO classes from the SDK — existing Durable Objects may still depend on them.
+export { Sandbox, SandboxStandard1, SandboxStandard2, SandboxStandard3 } from '@cloudflare/sandbox';
 
 // =============================================================================
 // Exports

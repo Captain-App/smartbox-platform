@@ -26,10 +26,12 @@ fi
 echo "=== Moltbot Startup $(date -Iseconds) ==="
 echo "User ID: ${OPENCLAW_USER_ID:-'(not set)'}"
 
-# Check if openclaw gateway is already running - bail early if so
+# Check if openclaw gateway is already running.
+# IMPORTANT: do NOT bail before ensuring config invariants (Telegram + model).
+GATEWAY_ALREADY_RUNNING=0
 if pgrep -f "openclaw gateway" > /dev/null 2>&1; then
-    echo "Moltbot gateway is already running, exiting."
-    exit 0
+    echo "Moltbot gateway is already running. Will only reconcile config + exit."
+    GATEWAY_ALREADY_RUNNING=1
 fi
 
 # ============================================================
@@ -279,6 +281,11 @@ trap shutdown_handler SIGTERM SIGINT
 # ============================================================
 # START GATEWAY
 # ============================================================
+if [ "$GATEWAY_ALREADY_RUNNING" = "1" ]; then
+  echo "Gateway already running; config reconciled. Exiting without starting another gateway."
+  exit 0
+fi
+
 echo "Starting Moltbot Gateway..."
 echo "Gateway will be available on port 18789"
 

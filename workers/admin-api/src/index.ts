@@ -76,8 +76,17 @@ app.notFound((c) => {
 // Container Classes (required for container bindings)
 // =============================================================================
 
-// Re-export container/DO classes from the SDK — existing Durable Objects may still depend on them.
-export { Sandbox, SandboxStandard1, SandboxStandard2, SandboxStandard3 } from '@cloudflare/sandbox';
+// Container/DO classes.
+//
+// We MUST export class names that already have Durable Objects on prod.
+// Even if we no longer use SandboxStandard*, Cloudflare will refuse deploys
+// unless the classes still exist (or we run an explicit delete-class migration).
+import { Sandbox as SandboxBase } from '@cloudflare/sandbox';
+
+export class Sandbox extends SandboxBase {}
+export class SandboxStandard1 extends SandboxBase {}
+export class SandboxStandard2 extends SandboxBase {}
+export class SandboxStandard3 extends SandboxBase {}
 
 // =============================================================================
 // Exports

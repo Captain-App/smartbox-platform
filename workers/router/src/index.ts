@@ -149,6 +149,11 @@ app.get('/api/status', async (c) => {
 // Admin API Routes with Feature Flag
 // =============================================================================
 
+// Direct health passthrough for debugging control-plane availability
+app.get('/_debug/admin-api/health', async (c) => {
+  return c.env.ADMIN_API.fetch(new Request('https://admin-api.internal/health'));
+});
+
 app.all('/api/super/*', async (c) => {
   const env = c.env;
   const useNewAdminApi = env.USE_NEW_ADMIN_API === 'true';

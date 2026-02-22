@@ -656,25 +656,41 @@ adminRouter.post('/users/:id/message', async (c) => {
     // Ensure gateway is running first
     await ensureMoltbotGateway(sandbox, c.env, userId);
 
-    // Use openclaw agent CLI to send message to local gateway
-    const escapedMessage = message.replace(/'/g, "'\\''");
-    // openclaw agent expects --message / -m; older positional-arg style will fail.
-    // Also: session flag is --session-id (not --session).
-    const sessionFlag = sessionKey ? `--session-id '${sessionKey}'` : "--agent 'main'";
+    // Use gateway hook directly (avoids hanging exec sessions and CLI/model mismatches)
+    // Derive the same per-user gateway token we use for gateway.auth.token.
+    const master = c.env.MOLTBOT_GATEWAY_MASTER_TOKEN || '';
+    const enc = new TextEncoder();
+    const key = await crypto.subtle.importKey('raw', enc.encode(master), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const sig = await crypto.subtle.sign('HMAC', key, enc.encode(`gateway-token:${userId}`));
+    const token = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
 
-    // Keep this tight: if the agent can't respond quickly, treat as failure and don't backlog.
-    // NOTE: sandbox OpenClaw is currently 2026.2.4; it does NOT support --model.
-    // We also force delivery back to Jack on Telegram so "success" is visible.
-    // (Caller can still override via sessionKey in the future if needed.)
-    const cmd = `openclaw agent ${sessionFlag} --thinking minimal --message '${escapedMessage}' --deliver --reply-channel telegram --reply-to 5322411764 2>&1`;
-    const result = await sandbox.exec(cmd, { timeout: 12000 });
+    const hookPayload: any = {
+      message,
+      name: 'Admin',
+      sessionKey: sessionKey || undefined,
+      deliver: true,
+      channel: 'telegram',
+      to: '5322411764',
+      thinking: 'minimal',
+    };
+
+    const hookReq = new Request('http://localhost:18789/hooks/agent', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-openclaw-token': token,
+      },
+      body: JSON.stringify(hookPayload),
+    });
+
+    const hookResp = await sandbox.containerFetch(hookReq, 18789);
+    const hookText = await hookResp.text().catch(() => '');
 
     const payload = {
       userId,
       message,
-      response: result.stdout || '',
-      stderr: result.stderr || '',
-      exitCode: result.exitCode,
+      status: hookResp.status,
+      response: hookText,
       timestamp: new Date().toISOString(),
     };
 

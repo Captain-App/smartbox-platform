@@ -113,7 +113,7 @@ export async function ensureMoltbotGateway(sandbox: any, env: any, userId: strin
 
   exports.push(`export OPENCLAW_USER_ID='${esc(userId)}'`);
   if (injectedConfigB64) exports.push(`export OPENCLAW_CONFIG_B64='${esc(injectedConfigB64)}'`);
-  if (env.CAPTAINAPP_USER_KEY) exports.push(`export CAPTAINAPP_USER_KEY='${esc(String(env.CAPTAINAPP_USER_KEY))}'`);
+  if (env.CAPTAINAPP_MASTER_KEY) exports.push(`export CAPTAINAPP_MASTER_KEY='${esc(String(env.CAPTAINAPP_MASTER_KEY))}'`);
   if (env.OPENAI_API_KEY) exports.push(`export OPENAI_API_KEY='${esc(String(env.OPENAI_API_KEY))}'`);
 
   // Derive per-user gateway token

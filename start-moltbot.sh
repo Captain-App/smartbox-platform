@@ -136,10 +136,17 @@ config.plugins.entries = config.plugins.entries || {};
 
 // Lego brick #1: prefer CaptainApp metered provider when available
 // If CAPTAINAPP_API_KEY isn't provided, fall back to Moonshot.
-// If we have a master/user key, synthesize per-user CAPTAINAPP_API_KEY
-// in the format expected by OpenClaw: "<userId>:<userKey>".
-if (process.env.CAPTAINAPP_USER_KEY && process.env.OPENCLAW_USER_ID) {
-  process.env.CAPTAINAPP_API_KEY = `${process.env.OPENCLAW_USER_ID}:${process.env.CAPTAINAPP_USER_KEY}`;
+// If we have CAPTAINAPP_MASTER_KEY, derive the per-user key as:
+//   hex(HMAC_SHA256(master, `captainapp-key:${userId}`))
+// This matches captainapp-proxy's validateHmacKey().
+if (process.env.CAPTAINAPP_MASTER_KEY && process.env.OPENCLAW_USER_ID) {
+  const crypto = require('crypto');
+  const userId = process.env.OPENCLAW_USER_ID;
+  const master = process.env.CAPTAINAPP_MASTER_KEY;
+  const h = crypto.createHmac('sha256', master);
+  h.update(`captainapp-key:${userId}`);
+  const userKey = h.digest('hex');
+  process.env.CAPTAINAPP_API_KEY = `${userId}:${userKey}`;
 }
 
 // Prefer CaptainApp metered. If unavailable, fall back to OpenAI (known-good) rather than Moonshot.
@@ -248,8 +255,10 @@ AGENT_DIR="/root/.openclaw/agents/main/agent"
 mkdir -p "$AGENT_DIR"
 
 # Synthesize CAPTAINAPP_API_KEY from per-deployment key + user id.
-if [ -n "$CAPTAINAPP_USER_KEY" ] && [ -n "$OPENCLAW_USER_ID" ]; then
-  export CAPTAINAPP_API_KEY="$OPENCLAW_USER_ID:$CAPTAINAPP_USER_KEY"
+# CAPTAINAPP_MASTER_KEY is passed by the control plane.
+# Derive per-user key exactly like captainapp-proxy expects.
+if [ -n "$CAPTAINAPP_MASTER_KEY" ] && [ -n "$OPENCLAW_USER_ID" ]; then
+  export CAPTAINAPP_API_KEY="$OPENCLAW_USER_ID:$(node -e "const crypto=require('crypto'); const m=process.env.CAPTAINAPP_MASTER_KEY; const u=process.env.OPENCLAW_USER_ID; process.stdout.write(crypto.createHmac('sha256', m).update('captainapp-key:'+u).digest('hex'));" )"
 fi
 
 if [ -n "$CAPTAINAPP_API_KEY" ]; then

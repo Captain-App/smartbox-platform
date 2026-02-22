@@ -90,20 +90,31 @@ export async function ensureMoltbotGateway(sandbox: any, env: any, userId: strin
     if (gatewayRunning) return;
   } catch { /* cold container — proceed */ }
 
-  // Generate presigned restore URL
+  // Generate presigned restore + config URLs
   let restoreUrl: string | null = null;
+  let configUrl: string | null = null;
   if (env.R2_ACCESS_KEY_ID && env.R2_SECRET_ACCESS_KEY && env.CF_ACCOUNT_ID) {
     try {
+      const bucket = env.R2_BUCKET_NAME || 'moltbot-data';
       restoreUrl = await presignR2Url({
         accessKeyId: env.R2_ACCESS_KEY_ID,
         secretAccessKey: env.R2_SECRET_ACCESS_KEY,
         accountId: env.CF_ACCOUNT_ID,
-        bucket: env.R2_BUCKET_NAME || 'moltbot-data',
+        bucket,
         key: `users/${userId}/backup.tar.gz`,
         method: 'GET',
         expiresIn: 300,
       });
-      console.log(`[gateway-shim] Presigned restore URL generated for ${userId.slice(0, 8)}...`);
+      configUrl = await presignR2Url({
+        accessKeyId: env.R2_ACCESS_KEY_ID,
+        secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+        accountId: env.CF_ACCOUNT_ID,
+        bucket,
+        key: `users/${userId}/openclaw/openclaw.json`,
+        method: 'GET',
+        expiresIn: 300,
+      });
+      console.log(`[gateway-shim] Presigned restore+config URLs generated for ${userId.slice(0, 8)}...`);
     } catch (err) {
       console.warn('[gateway-shim] Presign failed:', err);
     }
@@ -112,6 +123,7 @@ export async function ensureMoltbotGateway(sandbox: any, env: any, userId: strin
   // Build env vars
   const startEnv: Record<string, string> = { OPENCLAW_USER_ID: userId };
   if (restoreUrl) startEnv.RESTORE_URL = restoreUrl;
+  if (configUrl) startEnv.CONFIG_URL = configUrl;
   
   // Derive per-user gateway token
   if (env.MOLTBOT_GATEWAY_MASTER_TOKEN) {

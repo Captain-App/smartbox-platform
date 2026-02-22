@@ -76,15 +76,26 @@ if [ ! -L "/workspace/docs" ] && [ ! -d "/workspace/docs" ]; then
     ln -sfn /usr/local/lib/node_modules/@captain-app/openclaw/docs /workspace/docs 2>/dev/null || true
 fi
 
-# If we have a presigned config URL, prefer it (restores channels/plugins/models)
-if [ -n "$CONFIG_URL" ]; then
-    echo "Fetching config from R2 (presigned URL)..."
-    if curl -sf "$CONFIG_URL" > "$CONFIG_FILE"; then
-        echo "Config fetched"
-    else
-        echo "WARNING: Failed to fetch config from CONFIG_URL"
-    fi
-    unset CONFIG_URL
+# If we have injected config, prefer it (restores channels/plugins/models)
+if [ -n "$OPENCLAW_CONFIG_B64" ]; then
+    echo "Writing injected config from OPENCLAW_CONFIG_B64..."
+    python3 - <<'PY'
+import base64, os
+cfg_b64=os.environ.get('OPENCLAW_CONFIG_B64','')
+# unicode-safe: inverse of btoa(unescape(encodeURIComponent(txt)))
+raw=base64.b64decode(cfg_b64)
+text=raw.decode('utf-8','replace')
+# In case of the JS unicode-safe wrapper, it is actually percent-encoded bytes.
+# Try to undo that; fall back to raw.
+try:
+    import urllib.parse
+    text=urllib.parse.unquote_to_bytes(text).decode('utf-8','replace')
+except Exception:
+    pass
+open('/root/.openclaw/openclaw.json','w',encoding='utf-8').write(text)
+print('Config written:', len(text), 'bytes')
+PY
+    unset OPENCLAW_CONFIG_B64
 fi
 
 # If config file doesn't exist, create from template

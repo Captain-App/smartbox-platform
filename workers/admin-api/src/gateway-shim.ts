@@ -90,40 +90,26 @@ export async function ensureMoltbotGateway(sandbox: any, env: any, userId: strin
     if (gatewayRunning) return;
   } catch { /* cold container — proceed */ }
 
-  // Generate presigned restore + config URLs
-  let restoreUrl: string | null = null;
-  let configUrl: string | null = null;
-  if (env.R2_ACCESS_KEY_ID && env.R2_SECRET_ACCESS_KEY && env.CF_ACCOUNT_ID) {
-    try {
-      const bucket = env.R2_BUCKET_NAME || 'moltbot-data';
-      restoreUrl = await presignR2Url({
-        accessKeyId: env.R2_ACCESS_KEY_ID,
-        secretAccessKey: env.R2_SECRET_ACCESS_KEY,
-        accountId: env.CF_ACCOUNT_ID,
-        bucket,
-        key: `users/${userId}/backup.tar.gz`,
-        method: 'GET',
-        expiresIn: 300,
-      });
-      configUrl = await presignR2Url({
-        accessKeyId: env.R2_ACCESS_KEY_ID,
-        secretAccessKey: env.R2_SECRET_ACCESS_KEY,
-        accountId: env.CF_ACCOUNT_ID,
-        bucket,
-        key: `users/${userId}/openclaw/openclaw.json`,
-        method: 'GET',
-        expiresIn: 300,
-      });
-      console.log(`[gateway-shim] Presigned restore+config URLs generated for ${userId.slice(0, 8)}...`);
-    } catch (err) {
-      console.warn('[gateway-shim] Presign failed:', err);
+  // Load config from R2 and inject it directly (avoids presign + ensures channels/plugins/models are present)
+  let injectedConfigB64: string | null = null;
+  try {
+    const key = `users/${userId}/openclaw/openclaw.json`;
+    const obj = await env.MOLTBOT_BUCKET?.get?.(key);
+    if (obj) {
+      const txt = await obj.text();
+      // base64 encode in a unicode-safe way
+      injectedConfigB64 = btoa(unescape(encodeURIComponent(txt)));
+      console.log(`[gateway-shim] Injecting openclaw.json from R2 for ${userId.slice(0, 8)} (${txt.length} bytes)`);
+    } else {
+      console.warn(`[gateway-shim] No openclaw.json found in R2 for ${userId.slice(0, 8)}`);
     }
+  } catch (err) {
+    console.warn('[gateway-shim] Failed to load config from R2:', err);
   }
 
   // Build env vars
   const startEnv: Record<string, string> = { OPENCLAW_USER_ID: userId };
-  if (restoreUrl) startEnv.RESTORE_URL = restoreUrl;
-  if (configUrl) startEnv.CONFIG_URL = configUrl;
+  if (injectedConfigB64) startEnv.OPENCLAW_CONFIG_B64 = injectedConfigB64;
   
   // Derive per-user gateway token
   if (env.MOLTBOT_GATEWAY_MASTER_TOKEN) {

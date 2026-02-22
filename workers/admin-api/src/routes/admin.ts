@@ -570,50 +570,157 @@ adminRouter.post('/users/:id/exec-sync', async (c) => {
 
 // =============================================================================
 // Message endpoint — send a message to a bot's gateway via openclaw agent CLI
+//
+// IMPORTANT: This endpoint used to contribute to DO overload by repeatedly
+// hitting a sick control-plane. We add:
+//   - circuit breaker (short-circuit for a short window after overload)
+//   - dedupe (collapse identical requests for a short window)
+//   - tighter timeouts (keep Worker requests bounded)
 // =============================================================================
 
 adminRouter.post('/users/:id/message', async (c) => {
   const userId = c.req.param('id');
-  
+
   let body;
   try {
     body = await c.req.json();
   } catch {
     return c.json({ error: 'Invalid JSON body' }, HTTP_STATUS.BAD_REQUEST);
   }
-  
+
   const { message, sessionKey } = body;
   if (!message || typeof message !== 'string') {
     return c.json({ error: 'message is required' }, HTTP_STATUS.BAD_REQUEST);
   }
-  
+
+  // Circuit breaker (cache-backed): if we recently saw overload, stop piling on.
+  const breakerKey = new Request(`https://admin-api.internal/cb/message/${userId}`);
+  const breakerHit = await caches.default.match(breakerKey);
+  if (breakerHit) {
+    const info = await breakerHit.json().catch(() => ({} as any));
+    return c.json(
+      {
+        userId,
+        error: 'circuit_open',
+        message: 'Message endpoint temporarily disabled due to recent overload. Try again shortly.',
+        retryAfterSeconds: info?.retryAfterSeconds ?? 60,
+      },
+      503,
+      {
+        'Retry-After': String(info?.retryAfterSeconds ?? 60),
+        'Cache-Control': 'no-store',
+      }
+    );
+  }
+
+  // Dedupe identical requests briefly to prevent retry storms (cache-backed).
+  const hashBuf = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(`${userId}|${sessionKey ?? ''}|${message}`)
+  );
+  const hashHex = Array.from(new Uint8Array(hashBuf))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+
+  const dedupeKey = new Request(`https://admin-api.internal/dedupe/message/${hashHex}`);
+  const deduped = await caches.default.match(dedupeKey);
+  if (deduped) {
+    // Return exact cached response
+    const cachedText = await deduped.text();
+    return new Response(cachedText, {
+      status: deduped.status,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Deduped': '1',
+        'Cache-Control': 'no-store',
+      },
+    });
+  }
+
   try {
     const sandbox = await getUserSandbox(c.env, userId, true);
-    
+
     // Ensure gateway is running first
     await ensureMoltbotGateway(sandbox, c.env, userId);
-    
+
     // Use openclaw agent CLI to send message to local gateway
     const escapedMessage = message.replace(/'/g, "'\\''");
     const sessionFlag = sessionKey ? `--session '${sessionKey}'` : '';
+
+    // Keep this tight: if the agent can't respond quickly, treat as failure and don't backlog.
     const cmd = `openclaw agent '${escapedMessage}' ${sessionFlag} 2>&1`;
-    
-    const result = await sandbox.exec(cmd, { timeout: 25000 });
-    
-    return c.json({
+    const result = await sandbox.exec(cmd, { timeout: 12000 });
+
+    const payload = {
       userId,
       message,
       response: result.stdout || '',
       stderr: result.stderr || '',
       exitCode: result.exitCode,
       timestamp: new Date().toISOString(),
-    });
+    };
+
+    const resp = c.json(payload);
+
+    // Cache success briefly for dedupe.
+    // NOTE: caches.default respects Cache-Control: max-age.
+    c.executionCtx.waitUntil(
+      caches.default.put(
+        dedupeKey,
+        new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/json',
+            'Cache-Control': 'public, max-age=60',
+          },
+        })
+      )
+    );
+
+    return resp;
   } catch (error) {
-    return c.json({
+    const msg = error instanceof Error ? error.message : String(error);
+
+    // If we detect overload symptoms, open the circuit for 2 minutes.
+    const isOverload = /overloaded|Too many requests queued/i.test(msg);
+    if (isOverload) {
+      const retryAfterSeconds = 120;
+      c.executionCtx.waitUntil(
+        caches.default.put(
+          breakerKey,
+          new Response(JSON.stringify({ retryAfterSeconds }), {
+            status: 200,
+            headers: {
+              'Content-Type': 'application/json',
+              'Cache-Control': `public, max-age=${retryAfterSeconds}`,
+            },
+          })
+        )
+      );
+    }
+
+    const payload = {
       userId,
-      error: error instanceof Error ? error.message : 'Unknown error',
+      error: msg,
+      circuitOpened: isOverload || undefined,
       timestamp: new Date().toISOString(),
-    }, HTTP_STATUS.INTERNAL_SERVER_ERROR);
+    };
+
+    // Cache error briefly for dedupe (prevents hammering on repeat).
+    c.executionCtx.waitUntil(
+      caches.default.put(
+        dedupeKey,
+        new Response(JSON.stringify(payload), {
+          status: 500,
+          headers: {
+            'Content-Type': 'application/json',
+            'Cache-Control': 'public, max-age=15',
+          },
+        })
+      )
+    );
+
+    return c.json(payload, HTTP_STATUS.INTERNAL_SERVER_ERROR);
   }
 });
 

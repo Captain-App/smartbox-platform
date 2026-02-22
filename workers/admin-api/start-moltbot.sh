@@ -137,7 +137,7 @@ fi
 # ============================================================
 # UPDATE CONFIG FROM ENVIRONMENT VARIABLES
 # ============================================================
-node << EOFNODE
+node << 'EOFNODE'
 const fs = require('fs');
 
 const configPath = '/root/.openclaw/openclaw.json';

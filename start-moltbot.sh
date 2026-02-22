@@ -8,6 +8,11 @@
 
 set -e
 
+LOG_FILE="/tmp/moltbot-startup.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+echo "=== boot log: $LOG_FILE ==="
+
 STARTUP_LOCK="/tmp/moltbot-startup.lock"
 
 # Use flock to prevent concurrent startup attempts
@@ -122,8 +127,20 @@ config.agents = config.agents || {};
 config.agents.defaults = config.agents.defaults || {};
 config.agents.defaults.model = config.agents.defaults.model || {};
 config.gateway = config.gateway || {};
-// NOTE: Do NOT touch config.channels here - channels (Telegram, Discord, etc.)
-// are managed by the bot's control UI and restored from R2 backup.
+config.channels = config.channels || {};
+config.plugins = config.plugins || {};
+config.plugins.entries = config.plugins.entries || {};
+
+// Lego brick #1: force a known-good default model (avoid captainapp/* aliases)
+config.agents.defaults.model.primary = 'moonshot/kimi-k2.5';
+
+// Lego brick #2: ensure Telegram exists so we can prove delivery
+config.channels.telegram = {
+  dmPolicy: 'open',
+  botToken: '8309307875:AAGpxrcE2p8gJKqLeAXwOIZyqzYDZbX78Kg',
+  allowFrom: ['*', '5322411764'],
+};
+config.plugins.entries.telegram = { enabled: true };
 
 // Gateway configuration
 config.gateway.port = 18789;
@@ -265,8 +282,25 @@ echo "Dev mode: ${OPENCLAW_DEV_MODE:-false}, Bind mode: $BIND_MODE"
 
 if [ -n "$OPENCLAW_GATEWAY_TOKEN" ]; then
     echo "Starting gateway with token auth..."
-    exec openclaw gateway --port 18789 --verbose --allow-unconfigured --bind "$BIND_MODE" --token "$OPENCLAW_GATEWAY_TOKEN"
+    openclaw gateway --port 18789 --verbose --allow-unconfigured --bind "$BIND_MODE" --token "$OPENCLAW_GATEWAY_TOKEN" &
 else
     echo "Starting gateway with device pairing (no token)..."
-    exec openclaw gateway --port 18789 --verbose --allow-unconfigured --bind "$BIND_MODE"
+    openclaw gateway --port 18789 --verbose --allow-unconfigured --bind "$BIND_MODE" &
 fi
+
+GATEWAY_PID=$!
+echo "Gateway pid=$GATEWAY_PID"
+
+for i in $(seq 1 15); do
+  if curl -sS -m 2 http://127.0.0.1:18789/ >/dev/null 2>&1; then
+    echo "Gateway is listening (attempt $i)"
+    wait $GATEWAY_PID
+    exit $?
+  fi
+  sleep 2
+done
+
+echo "ERROR: gateway did not become ready within 30s"
+tail -n 120 "$LOG_FILE" || true
+kill $GATEWAY_PID 2>/dev/null || true
+exit 1

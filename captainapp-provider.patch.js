@@ -198,7 +198,8 @@ function buildCaptainAppProvider(apiKey) {
 \t\tapiKey: userKey,
 \t\theaders: userId ? {
 \t\t\t"X-CaptainApp-User-ID": userId,
-\t\t\t"X-CaptainApp-User-Key": userKey
+\t\t\t"X-CaptainApp-User-Key": userKey,
+\t\t\t"User-Agent": "OpenClawSandbox/2026.2.4"
 \t\t} : undefined,
 \t\tmodels: [{
 \t\t\tid: CAPTAINAPP_DEFAULT_MODEL_ID,

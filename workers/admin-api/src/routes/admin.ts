@@ -664,8 +664,9 @@ adminRouter.post('/users/:id/message', async (c) => {
 
     // Keep this tight: if the agent can't respond quickly, treat as failure and don't backlog.
     // NOTE: sandbox OpenClaw is currently 2026.2.4; it does NOT support --model.
-    // Keep invocation minimal and force agent selection so it doesn't error.
-    const cmd = `openclaw agent ${sessionFlag} --thinking minimal --message '${escapedMessage}' 2>&1`;
+    // We also force delivery back to Jack on Telegram so "success" is visible.
+    // (Caller can still override via sessionKey in the future if needed.)
+    const cmd = `openclaw agent ${sessionFlag} --thinking minimal --message '${escapedMessage}' --deliver --reply-channel telegram --reply-to 5322411764 2>&1`;
     const result = await sandbox.exec(cmd, { timeout: 12000 });
 
     const payload = {

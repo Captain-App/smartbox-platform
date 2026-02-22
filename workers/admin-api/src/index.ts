@@ -85,6 +85,7 @@ import { Sandbox as SandboxBase } from '@cloudflare/sandbox';
 
 export class Sandbox extends SandboxBase {}
 export class SandboxV4 extends SandboxBase {}
+export class SandboxV5 extends SandboxBase {}
 export class SandboxStandard1 extends SandboxBase {}
 export class SandboxStandard2 extends SandboxBase {}
 export class SandboxStandard3 extends SandboxBase {}

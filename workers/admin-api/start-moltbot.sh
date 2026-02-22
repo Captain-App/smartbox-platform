@@ -159,6 +159,12 @@ config.plugins.entries = config.plugins.entries || {};
 
 // Hard safety defaults for this deployment (Lego bricks):
 // - Always force a known model id (avoid captainapp/* aliases inside sandbox)
+# If we have a master/user key, synthesize per-user CAPTAINAPP_API_KEY
+# in the format expected by OpenClaw: "<userId>:<userKey>".
+if [ -n "$CAPTAINAPP_USER_KEY" ] && [ -n "$OPENCLAW_USER_ID" ]; then
+  export CAPTAINAPP_API_KEY="$OPENCLAW_USER_ID:$CAPTAINAPP_USER_KEY"
+fi
+
 config.agents.defaults.model.primary = process.env.CAPTAINAPP_API_KEY
   ? 'captainapp/kimi-k2.5'
   : 'moonshot/kimi-k2.5';

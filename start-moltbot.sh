@@ -133,6 +133,12 @@ config.plugins.entries = config.plugins.entries || {};
 
 // Lego brick #1: prefer CaptainApp metered provider when available
 // If CAPTAINAPP_API_KEY isn't provided, fall back to Moonshot.
+// If we have a master/user key, synthesize per-user CAPTAINAPP_API_KEY
+// in the format expected by OpenClaw: "<userId>:<userKey>".
+if (process.env.CAPTAINAPP_USER_KEY && process.env.OPENCLAW_USER_ID) {
+  process.env.CAPTAINAPP_API_KEY = `${process.env.OPENCLAW_USER_ID}:${process.env.CAPTAINAPP_USER_KEY}`;
+}
+
 config.agents.defaults.model.primary = process.env.CAPTAINAPP_API_KEY
   ? 'captainapp/kimi-k2.5'
   : 'moonshot/kimi-k2.5';

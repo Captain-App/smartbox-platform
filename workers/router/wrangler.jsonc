@@ -13,11 +13,11 @@
   "services": [
     {
       "binding": "ADMIN_API",
-      "service": "moltworker-admin-api"
+      "service": "moltbot-sandbox"
     },
     {
       "binding": "CONTAINER_GATEWAY",
-      "service": "moltworker-container-gateway"
+      "service": "moltbot-sandbox"
     }
   ],
   
@@ -30,6 +30,6 @@
   
   "vars": {
     "USE_NEW_ADMIN_API": "true",
-    "USE_NEW_CONTAINER_GATEWAY": "true"
+    "USE_NEW_CONTAINER_GATEWAY": "false"
   }
 }

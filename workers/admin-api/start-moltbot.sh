@@ -26,6 +26,7 @@ fi
 
 echo "=== Moltbot Startup $(date -Iseconds) ==="
 echo "User ID: ${OPENCLAW_USER_ID:-'(not set)'}"
+echo "CAPTAINAPP_USER_KEY: ${CAPTAINAPP_USER_KEY:+set}"
 
 # Check if openclaw gateway is already running.
 # IMPORTANT: do NOT bail before ensuring config invariants (Telegram + model).

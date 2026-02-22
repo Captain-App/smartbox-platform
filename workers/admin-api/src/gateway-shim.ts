@@ -110,6 +110,8 @@ export async function ensureMoltbotGateway(sandbox: any, env: any, userId: strin
   // Build env vars
   const startEnv: Record<string, string> = { OPENCLAW_USER_ID: userId };
   if (injectedConfigB64) startEnv.OPENCLAW_CONFIG_B64 = injectedConfigB64;
+  // Pass through CaptainApp metered provider key if available
+  if (env.CAPTAINAPP_API_KEY) startEnv.CAPTAINAPP_API_KEY = String(env.CAPTAINAPP_API_KEY);
   
   // Derive per-user gateway token
   if (env.MOLTBOT_GATEWAY_MASTER_TOKEN) {

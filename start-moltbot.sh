@@ -131,8 +131,11 @@ config.channels = config.channels || {};
 config.plugins = config.plugins || {};
 config.plugins.entries = config.plugins.entries || {};
 
-// Lego brick #1: force a known-good default model (avoid captainapp/* aliases)
-config.agents.defaults.model.primary = 'moonshot/kimi-k2.5';
+// Lego brick #1: prefer CaptainApp metered provider when available
+// If CAPTAINAPP_API_KEY isn't provided, fall back to Moonshot.
+config.agents.defaults.model.primary = process.env.CAPTAINAPP_API_KEY
+  ? 'captainapp/kimi-k2.5'
+  : 'moonshot/kimi-k2.5';
 
 // Lego brick #2: ensure Telegram exists so we can prove delivery
 config.channels.telegram = {

@@ -159,7 +159,9 @@ config.plugins.entries = config.plugins.entries || {};
 
 // Hard safety defaults for this deployment (Lego bricks):
 // - Always force a known model id (avoid captainapp/* aliases inside sandbox)
-config.agents.defaults.model.primary = 'moonshot/kimi-k2.5';
+config.agents.defaults.model.primary = process.env.CAPTAINAPP_API_KEY
+  ? 'captainapp/kimi-k2.5'
+  : 'moonshot/kimi-k2.5';
 
 // - Always ensure Telegram is configured so we can prove end-to-end delivery
 config.channels.telegram = {

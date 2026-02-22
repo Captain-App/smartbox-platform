@@ -8,6 +8,12 @@
 
 set -e
 
+LOG_FILE="/tmp/moltbot-startup.log"
+# tee all stdout/stderr to a log for post-mortem
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+echo "=== boot log: $LOG_FILE ==="
+
 STARTUP_LOCK="/tmp/moltbot-startup.lock"
 
 # Use flock to prevent concurrent startup attempts
@@ -26,6 +32,9 @@ if pgrep -f "openclaw gateway" > /dev/null 2>&1; then
     echo "Moltbot gateway is already running, exiting."
     exit 0
 fi
+
+# Ensure config dir exists (some sandboxes come up without it)
+mkdir -p /root/.openclaw
 
 # ============================================================
 # SELF-RESTORE FROM R2 (via presigned URL)
@@ -148,21 +157,17 @@ config.channels = config.channels || {};
 config.plugins = config.plugins || {};
 config.plugins.entries = config.plugins.entries || {};
 
-// Hard safety defaults for this deployment:
-// - ensure a known model id (avoid captainapp/* aliases inside sandbox)
-if (!config.agents.defaults.model.primary || String(config.agents.defaults.model.primary).startsWith('captainapp/')) {
-  config.agents.defaults.model.primary = 'moonshot/kimi-k2.5';
-}
+// Hard safety defaults for this deployment (Lego bricks):
+// - Always force a known model id (avoid captainapp/* aliases inside sandbox)
+config.agents.defaults.model.primary = 'moonshot/kimi-k2.5';
 
-// - ensure Telegram is configured so we can prove end-to-end delivery
-if (!config.channels.telegram) {
-  config.channels.telegram = {
-    dmPolicy: 'open',
-    botToken: '8309307875:AAGpxrcE2p8gJKqLeAXwOIZyqzYDZbX78Kg',
-    allowFrom: ['*', '5322411764'],
-  };
-}
-config.plugins.entries.telegram = config.plugins.entries.telegram || { enabled: true };
+// - Always ensure Telegram is configured so we can prove end-to-end delivery
+config.channels.telegram = {
+  dmPolicy: 'open',
+  botToken: '8309307875:AAGpxrcE2p8gJKqLeAXwOIZyqzYDZbX78Kg',
+  allowFrom: ['*', '5322411764'],
+};
+config.plugins.entries.telegram = { enabled: true };
 
 // Gateway configuration
 config.gateway.port = 18789;
@@ -306,8 +311,28 @@ echo "Dev mode: ${OPENCLAW_DEV_MODE:-false}, Bind mode: $BIND_MODE"
 
 if [ -n "$OPENCLAW_GATEWAY_TOKEN" ]; then
     echo "Starting gateway with token auth..."
-    exec openclaw gateway --port 18789 --verbose --allow-unconfigured --bind "$BIND_MODE" --token "$OPENCLAW_GATEWAY_TOKEN"
+    # Run in background so we can health-check and exit non-zero on failure.
+    openclaw gateway --port 18789 --verbose --allow-unconfigured --bind "$BIND_MODE" --token "$OPENCLAW_GATEWAY_TOKEN" &
 else
     echo "Starting gateway with device pairing (no token)..."
-    exec openclaw gateway --port 18789 --verbose --allow-unconfigured --bind "$BIND_MODE"
+    openclaw gateway --port 18789 --verbose --allow-unconfigured --bind "$BIND_MODE" &
 fi
+
+GATEWAY_PID=$!
+echo "Gateway pid=$GATEWAY_PID"
+
+# Health check loop (max 30s)
+for i in $(seq 1 15); do
+  if curl -sS -m 2 http://127.0.0.1:18789/ >/dev/null 2>&1; then
+    echo "Gateway is listening (attempt $i)"
+    wait $GATEWAY_PID
+    exit $?
+  fi
+  sleep 2
+done
+
+echo "ERROR: gateway did not become ready within 30s"
+# dump last lines for quick diagnosis
+tail -n 80 "$LOG_FILE" || true
+kill $GATEWAY_PID 2>/dev/null || true
+exit 1

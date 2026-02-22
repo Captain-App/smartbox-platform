@@ -462,8 +462,19 @@ adminRouter.post('/users/:id/restart-async', async (c) => {
         
         // Start gateway
         await ensureMoltbotGateway(sandbox, c.env, userId);
-        
-        console.log(`[ASYNC-RESTART] Gateway started for ${userId.slice(0, 8)}`);
+
+        // Verify gateway health (this is the real success criteria)
+        const healthy = await checkHealth(sandbox);
+        if (!healthy) {
+          let logTail = '';
+          try {
+            const r = await sandbox.exec('tail -n 120 /tmp/moltbot-startup.log 2>/dev/null || true', { timeout: 5000 });
+            logTail = r.stdout || '';
+          } catch {}
+          throw new Error(`Gateway not healthy after restart\n--- startup log tail ---\n${logTail}`);
+        }
+
+        console.log(`[ASYNC-RESTART] Gateway healthy for ${userId.slice(0, 8)}`);
       } catch (err) {
         console.error(`[ASYNC-RESTART] Failed for ${userId.slice(0, 8)}:`, err);
       }
@@ -514,8 +525,18 @@ adminRouter.post('/bulk/restart', async (c) => {
         } catch { /* ignore */ }
         
         await ensureMoltbotGateway(sandbox, c.env, userId);
+
+        const healthy = await checkHealth(sandbox);
+        if (!healthy) {
+          let logTail = '';
+          try {
+            const r = await sandbox.exec('tail -n 120 /tmp/moltbot-startup.log 2>/dev/null || true', { timeout: 5000 });
+            logTail = r.stdout || '';
+          } catch {}
+          throw new Error(`Gateway not healthy after restart\n--- startup log tail ---\n${logTail}`);
+        }
         
-        console.log(`[BULK-RESTART] (${i + 1}/${targetIds.length}) ${userId.slice(0, 8)} restarted`);
+        console.log(`[BULK-RESTART] (${i + 1}/${targetIds.length}) ${userId.slice(0, 8)} healthy`);
       } catch (error) {
         console.error(`[BULK-RESTART] (${i + 1}/${targetIds.length}) ${userId.slice(0, 8)} failed:`, error);
       }

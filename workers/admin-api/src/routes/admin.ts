@@ -704,14 +704,18 @@ adminRouter.post('/users/:id/message', async (c) => {
       body: JSON.stringify(hookPayload),
     });
 
-    const hookResp = await sandbox.containerFetch(hookReq, 18789);
-    const hookText = await hookResp.text().catch(() => '');
+    // Fire-and-forget delivery by starting a process in the sandbox. This avoids
+    // the exec-result DO plumbing (which can wedge under load) and avoids waiting
+    // for Telegram API latency.
+    const safeMsg = message.replace(/"/g, '\\"');
+    const deliverCmd = `sh -lc "openclaw message send --channel telegram --target 5322411764 --message \"${safeMsg}\""`;
+    await sandbox.startProcess(deliverCmd);
 
     const payload = {
       userId,
       message,
-      status: hookResp.status,
-      response: hookText,
+      status: 202,
+      response: 'started',
       timestamp: new Date().toISOString(),
     };
 

@@ -79,6 +79,7 @@ function getGatewayMasterToken(env: AdminApiAppEnv['Bindings']): string {
 
 // Import gateway utilities (shim for worker isolation)
 import { getSandboxForUser, ensureMoltbotGateway, checkHealth } from '../gateway-shim.js';
+import { backupToR2 } from '../../../../src/gateway/tar-backup.js';
 
 const adminRouter = new Hono<AdminApiAppEnv>();
 
@@ -225,6 +226,31 @@ adminRouter.get('/users/lookup/:name', async (c) => {
 // =============================================================================
 // R2-Only Endpoints (No DO interaction)
 // =============================================================================
+
+adminRouter.post('/users/:id/backup-now', async (c) => {
+  const userId = c.req.param('id');
+
+  try {
+    const sandbox = await getUserSandbox(c.env, userId, true);
+    // Ensure gateway is up so /root/.openclaw/openclaw.json exists and is non-template.
+    await ensureMoltbotGateway(sandbox, c.env, userId);
+
+    const r2Prefix = `users/${userId}`;
+    const result = await backupToR2(sandbox as any, c.env as any, r2Prefix);
+
+    return c.json({ userId, r2Prefix, ...result, timestamp: new Date().toISOString() }, result.success ? 200 : 500);
+  } catch (err) {
+    return c.json(
+      {
+        userId,
+        success: false,
+        error: err instanceof Error ? err.message : String(err),
+        timestamp: new Date().toISOString(),
+      },
+      500
+    );
+  }
+});
 
 adminRouter.get('/users/:id/r2-status', async (c) => {
   const userId = c.req.param('id');

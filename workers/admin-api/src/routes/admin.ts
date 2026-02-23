@@ -229,27 +229,22 @@ adminRouter.get('/users/lookup/:name', async (c) => {
 
 adminRouter.post('/users/:id/backup-now', async (c) => {
   const userId = c.req.param('id');
+  const r2Prefix = `users/${userId}`;
 
-  try {
-    const sandbox = await getUserSandbox(c.env, userId, true);
-    // Ensure gateway is up so /root/.openclaw/openclaw.json exists and is non-template.
-    await ensureMoltbotGateway(sandbox, c.env, userId);
+  // Fire-and-forget: backups can take longer than typical HTTP timeouts.
+  // We start it in the background and return 202 immediately.
+  c.executionCtx.waitUntil((async () => {
+    try {
+      const sandbox = await getUserSandbox(c.env, userId, true);
+      await ensureMoltbotGateway(sandbox, c.env, userId);
+      const result = await backupToR2(sandbox as any, c.env as any, r2Prefix);
+      console.log('[backup-now]', userId.slice(0, 8), result);
+    } catch (err) {
+      console.error('[backup-now] failed', userId.slice(0, 8), err);
+    }
+  })());
 
-    const r2Prefix = `users/${userId}`;
-    const result = await backupToR2(sandbox as any, c.env as any, r2Prefix);
-
-    return c.json({ userId, r2Prefix, ...result, timestamp: new Date().toISOString() }, result.success ? 200 : 500);
-  } catch (err) {
-    return c.json(
-      {
-        userId,
-        success: false,
-        error: err instanceof Error ? err.message : String(err),
-        timestamp: new Date().toISOString(),
-      },
-      500
-    );
-  }
+  return c.json({ userId, r2Prefix, status: 'started', timestamp: new Date().toISOString() }, 202);
 });
 
 adminRouter.get('/users/:id/r2-status', async (c) => {

@@ -4,6 +4,7 @@
  */
 
 import { Hono } from 'hono';
+import { isSandboxNotReadyError, waitForSandboxReady, withRetry } from '../sandbox-resilience.js';
 
 // Inline shared types and constants
 interface AdminApiAppEnv {
@@ -125,11 +126,18 @@ async function getLiveState(userId: string, env: AdminApiAppEnv['Bindings']) {
   
   try {
     const sandbox = await getUserSandbox(env, userId, false);
-    
-    let processes: any[] = [];
-    try {
-      processes = await sandbox.listProcesses();
-    } catch (processError) {
+
+    // Best-effort readiness: avoid misclassifying cold-start as STOPPED.
+    await waitForSandboxReady(sandbox, { timeoutMs: 8000, intervalMs: 400 });
+
+    const procRes = await withRetry<any[]>(async () => sandbox.listProcesses(), {
+      retries: 3,
+      baseDelayMs: 200,
+      maxDelayMs: 1500,
+    });
+
+    if (!procRes.value) {
+      const processError = procRes.lastError;
       return {
         state: CONTAINER_STATES.STOPPED,
         userId,
@@ -140,6 +148,8 @@ async function getLiveState(userId: string, env: AdminApiAppEnv['Bindings']) {
         error: processError instanceof Error ? processError.message : 'Failed to list processes',
       };
     }
+
+    const processes: any[] = procRes.value;
     
     if (processes.length === 0) {
       return {
@@ -695,6 +705,16 @@ adminRouter.post('/users/:id/message', async (c) => {
   try {
     const sandbox = await getUserSandbox(c.env, userId, true);
 
+    const ready = await waitForSandboxReady(sandbox, { timeoutMs: 20000, intervalMs: 500 });
+    if (!ready.ready) {
+      const lastError = ready.lastError instanceof Error ? ready.lastError.message : String(ready.lastError ?? 'sandbox_not_ready');
+      return c.json(
+        { userId, error: 'sandbox_not_ready', attempts: ready.attempts, lastError, retryAfterSeconds: 30 },
+        503,
+        { 'Retry-After': '30', 'Cache-Control': 'no-store' }
+      );
+    }
+
     // Ensure gateway is running first
     await ensureMoltbotGateway(sandbox, c.env, userId);
 
@@ -730,7 +750,25 @@ adminRouter.post('/users/:id/message', async (c) => {
     // for Telegram API latency.
     const safeMsg = message.replace(/"/g, '\\"');
     const deliverCmd = `sh -lc "openclaw message send --channel telegram --target 5322411764 --message \"${safeMsg}\""`;
-    await sandbox.startProcess(deliverCmd);
+
+    const delivery = await withRetry(async () => {
+      await sandbox.startProcess(deliverCmd);
+      return true;
+    }, {
+      retries: 4,
+      baseDelayMs: 250,
+      maxDelayMs: 4000,
+    });
+
+    if (!delivery.value) {
+      const lastError = delivery.lastError instanceof Error ? delivery.lastError.message : String(delivery.lastError ?? 'delivery_failed');
+      const retryAfterSeconds = 30;
+      return c.json(
+        { userId, error: 'delivery_failed', attempts: delivery.attempts, lastError, retryAfterSeconds },
+        503,
+        { 'Retry-After': String(retryAfterSeconds), 'Cache-Control': 'no-store' }
+      );
+    }
 
     const payload = {
       userId,
@@ -760,6 +798,15 @@ adminRouter.post('/users/:id/message', async (c) => {
     return resp;
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
+
+    if (isSandboxNotReadyError(error)) {
+      const retryAfterSeconds = 30;
+      return c.json(
+        { userId, error: 'sandbox_not_ready', lastError: msg, retryAfterSeconds },
+        503,
+        { 'Retry-After': String(retryAfterSeconds), 'Cache-Control': 'no-store' }
+      );
+    }
 
     // If we detect overload symptoms, open the circuit for 2 minutes.
     const isOverload = /overloaded|Too many requests queued/i.test(msg);
@@ -850,8 +897,25 @@ adminRouter.post('/users/:id/exec', async (c) => {
   const backgroundPromise = (async () => {
     try {
       const sandbox = await getUserSandbox(c.env, userId, true);
-      
-      const proc = await sandbox.startProcess(fullCommand, { env: cmdEnv });
+
+      const ready = await waitForSandboxReady(sandbox, { timeoutMs: 20000, intervalMs: 500 });
+      if (!ready.ready) {
+        throw new Error(
+          `sandbox_not_ready after ${ready.attempts} attempts: ` +
+            (ready.lastError instanceof Error ? ready.lastError.message : String(ready.lastError ?? 'unknown'))
+        );
+      }
+
+      const started = await withRetry(async () => sandbox.startProcess(fullCommand, { env: cmdEnv }), {
+        retries: 4,
+        baseDelayMs: 250,
+        maxDelayMs: 4000,
+      });
+      if (!started.value) {
+        throw started.lastError instanceof Error ? started.lastError : new Error(String(started.lastError ?? 'Failed to start process'));
+      }
+
+      const proc = started.value as any;
       const result = await proc.waitForExit(timeout);
       const logs = await proc.getLogs();
       

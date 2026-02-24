@@ -328,7 +328,9 @@ echo "Gateway will be available on port 18789"
 rm -f /tmp/openclaw-gateway.lock 2>/dev/null || true
 rm -f "$CONFIG_DIR/gateway.lock" 2>/dev/null || true
 
-BIND_MODE="lan"
+# Cloudflare Sandbox networking is weird; binding to "lan" can fail and leave nothing listening.
+# Use loopback so containerFetch + local health checks work reliably.
+BIND_MODE="loopback"
 echo "Dev mode: ${OPENCLAW_DEV_MODE:-false}, Bind mode: $BIND_MODE"
 
 if [ -n "$OPENCLAW_GATEWAY_TOKEN" ]; then

@@ -18,6 +18,9 @@ interface AdminApiAppEnv {
     PLATFORM_DB: D1Database;
     MOLTBOT_GATEWAY_MASTER_TOKEN: string;
   };
+  Variables: {
+    isSuperAdmin: boolean;
+  };
 }
 
 const HTTP_STATUS = {
@@ -36,7 +39,7 @@ const HTTP_STATUS = {
   BAD_GATEWAY: 502,
   SERVICE_UNAVAILABLE: 503,
   GATEWAY_TIMEOUT: 504,
-};
+} as const;
 
 const CONTAINER_STATES = {
   ACTIVE: 'active',
@@ -46,6 +49,18 @@ const CONTAINER_STATES = {
   ERROR: 'error',
   STARTING: 'starting',
 } as const;
+type AdminContainerState = typeof CONTAINER_STATES[keyof typeof CONTAINER_STATES];
+
+interface LiveState {
+  state: AdminContainerState;
+  userId: string;
+  processCount: number;
+  gatewayHealthy: boolean | null;
+  checkedAt: string;
+  latencyMs: number;
+  error?: string;
+  lastSyncAt?: string;
+}
 
 const DEFAULT_USER_REGISTRY = [
   { userId: '32c7100e-c6ce-4cf8-8b64-edf4ac3b760b', name: 'jack', tier: 3 },
@@ -119,7 +134,7 @@ async function getUserSandbox(env: AdminApiAppEnv['Bindings'], userId: string, k
   });
 }
 
-async function getLiveState(userId: string, env: AdminApiAppEnv['Bindings']) {
+async function getLiveState(userId: string, env: AdminApiAppEnv['Bindings']): Promise<LiveState> {
   const startTime = Date.now();
   
   try {
@@ -155,7 +170,7 @@ async function getLiveState(userId: string, env: AdminApiAppEnv['Bindings']) {
     const gatewayHealthy = await checkGatewayHealth(sandbox);
     
     return {
-      state: gatewayHealthy ? CONTAINER_STATES.ACTIVE : 'starting',
+      state: gatewayHealthy ? CONTAINER_STATES.ACTIVE : CONTAINER_STATES.STARTING,
       userId,
       processCount: processes.length,
       gatewayHealthy,
@@ -293,7 +308,14 @@ adminRouter.get('/users/:id/state', async (c) => {
   try {
     const sandbox = await getUserSandbox(c.env, userId, false);
     
-    const status = {
+    const status: {
+      state: AdminContainerState;
+      lastActivity: string | null;
+      processCount: number;
+      memoryMB: number | null;
+      uptimeSeconds: number | null;
+      version: string | null;
+    } = {
       state: CONTAINER_STATES.STOPPED,
       lastActivity: null as string | null,
       processCount: 0,
@@ -385,7 +407,6 @@ adminRouter.get('/state/dashboard', async (c) => {
         return {
           state: CONTAINER_STATES.ERROR,
           userId,
-          name: DEFAULT_USER_REGISTRY.find(u => u.userId === userId)?.name || userId.slice(0, 8),
           processCount: 0,
           gatewayHealthy: null,
           checkedAt: new Date().toISOString(),
@@ -786,7 +807,7 @@ adminRouter.get('/users/:id/exec/:execId/status', async (c) => {
     }, HTTP_STATUS.NOT_FOUND);
   }
   
-  const result = await response.json();
+  const result = (await response.json()) as Record<string, unknown>;
   
   return c.json({
     execId,

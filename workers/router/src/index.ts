@@ -30,7 +30,7 @@ const HTTP_STATUS = {
   TOO_MANY_REQUESTS: 429,
   INTERNAL_SERVER_ERROR: 500,
   SERVICE_UNAVAILABLE: 503,
-};
+} as const;
 
 function generateRequestId(): string {
   return `req_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;

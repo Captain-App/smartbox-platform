@@ -28,7 +28,7 @@ export class ExecResultStore extends DurableObject {
   private sql: SqlStorage;
   private initialized = false;
 
-  constructor(ctx: DurableObjectState, env: unknown) {
+  constructor(ctx: DurableObjectState, env: any) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.ensureSchema();

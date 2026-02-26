@@ -25,7 +25,7 @@ async function sha256Hex(data: string): Promise<string> {
   return arrayToHex(new Uint8Array(hash));
 }
 
-async function hmacSign(key: ArrayBuffer, data: string): Promise<ArrayBuffer> {
+async function hmacSign(key: BufferSource, data: string): Promise<ArrayBuffer> {
   const cryptoKey = await crypto.subtle.importKey('raw', key, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   return crypto.subtle.sign('HMAC', cryptoKey, new TextEncoder().encode(data));
 }
@@ -36,7 +36,7 @@ async function hmacHex(key: ArrayBuffer, data: string): Promise<string> {
 }
 
 async function getSigningKey(secretKey: string, dateStamp: string, region: string, service: string): Promise<ArrayBuffer> {
-  const kDate = await hmacSign(new TextEncoder().encode(`AWS4${secretKey}`).buffer, dateStamp);
+  const kDate = await hmacSign(new TextEncoder().encode(`AWS4${secretKey}`), dateStamp);
   const kRegion = await hmacSign(kDate, region);
   const kService = await hmacSign(kRegion, service);
   return hmacSign(kService, 'aws4_request');

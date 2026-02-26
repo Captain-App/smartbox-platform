@@ -82,7 +82,7 @@ export interface RouterEnv extends BaseEnv {
  */
 export interface AdminApiEnv extends BaseEnv {
   // Durable Object for exec results
-  EXEC_RESULT_STORE: DurableObjectNamespace<ExecResultStore>;
+  EXEC_RESULT_STORE: DurableObjectNamespace;
   
   // D1 database for platform issues
   PLATFORM_DB?: D1Database;

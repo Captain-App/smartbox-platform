@@ -135,7 +135,7 @@ export function deepMerge<T extends Record<string, unknown>>(
   target: T,
   source: Record<string, unknown>
 ): T {
-  const result = { ...target };
+  const result: Record<string, unknown> = { ...target };
   
   for (const key of Object.keys(source)) {
     const sourceVal = source[key];
@@ -152,13 +152,13 @@ export function deepMerge<T extends Record<string, unknown>>(
       result[key] = deepMerge(
         targetVal as Record<string, unknown>,
         sourceVal as Record<string, unknown>
-      ) as T[Extract<keyof T, string>];
+      );
     } else {
-      result[key] = sourceVal as T[Extract<keyof T, string>];
+      result[key] = sourceVal;
     }
   }
   
-  return result;
+  return result as T;
 }
 
 /**

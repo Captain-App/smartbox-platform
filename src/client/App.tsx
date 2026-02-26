@@ -1,5 +1,5 @@
-import AdminPage from './pages/AdminPage'
-import './App.css'
+import AdminPage from './pages/AdminPage';
+import './App.css';
 
 function handleLogout() {
   // Navigate to logout endpoint which clears cookies and redirects to login
@@ -24,5 +24,5 @@ export default function App() {
         <AdminPage />
       </main>
     </div>
-  )
+  );
 }

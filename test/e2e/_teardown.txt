@@ -1,34 +1,30 @@
 ===
-stop video recording
+dump gateway logs for debugging
 ===
-./pw --session=moltworker-e2e video-stop || true
+WORKER_URL=$(cat "$CCTR_FIXTURE_DIR/worker-url.txt" 2>/dev/null || echo "")
+if [ -n "$WORKER_URL" ]; then
+    PROCS=$(./curl-auth -s "$WORKER_URL/debug/processes" 2>/dev/null || echo "")
+    PROC_ID=$(echo "$PROCS" | jq -r '[.processes[] | select(.command | contains("start-openclaw"))][0].id // empty' 2>/dev/null)
+    if [ -n "$PROC_ID" ]; then
+        echo "=== Gateway process logs ($PROC_ID) ==="
+        LOGS=$(./curl-auth -s "$WORKER_URL/debug/logs?id=$PROC_ID" 2>/dev/null)
+        echo "$LOGS" | jq -r '"STATUS: \(.process_status)\nSTDOUT: \(.stdout)\nSTDERR: \(.stderr)"' 2>/dev/null || echo "Failed to parse logs"
+    else
+        echo "No start-openclaw.sh process found"
+        echo "Processes: $PROCS"
+    fi
+else
+    echo "No worker URL found"
+fi
+echo "dump complete"
 ---
 {{ output }}
 ---
 where
-* output contains "Video" or output contains "Error" or output contains "No"
+* output contains "dump complete"
 
 ===
-save video recording
-===
-mkdir -p /tmp/moltworker-e2e-videos
-datetime=$(date +%Y%m%d-%H%M%S)
-for f in ./.playwright-cli/*.webm; do
-  if [ -f "$f" ]; then
-    cp "$f" "/tmp/moltworker-e2e-videos/${datetime}.webm"
-    echo "video saved to /tmp/moltworker-e2e-videos/${datetime}.webm"
-  fi
-done
-# Always succeed even if no video
-echo "video cleanup complete"
----
-{{ output }}
----
-where
-* output contains "video"
-
-===
-stop playwright browser
+stop playwright browser (saves video)
 ===
 ./stop-browser || true
 echo "browser stopped"

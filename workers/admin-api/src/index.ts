@@ -79,6 +79,10 @@ app.notFound((c) => {
 // Re-export Sandbox from the SDK — container bindings need the real class
 // NOTE: existing production deployments depend on the class name `SandboxV6`.
 export { Sandbox as SandboxV6 } from '@cloudflare/sandbox';
+// Legacy class names still referenced by existing Durable Objects in production.
+export { Sandbox as SandboxStandard1 } from '@cloudflare/sandbox';
+export { Sandbox as SandboxStandard2 } from '@cloudflare/sandbox';
+export { Sandbox as SandboxStandard3 } from '@cloudflare/sandbox';
 export { Sandbox } from '@cloudflare/sandbox';
 
 // =============================================================================

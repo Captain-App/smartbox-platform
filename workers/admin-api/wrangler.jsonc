@@ -3,13 +3,14 @@
   "name": "moltworker-admin-api",
   "main": "src/index.ts",
   "compatibility_date": "2025-05-06",
-  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
   "observability": {
     "enabled": true
   },
   "preview_urls": false,
   "workers_dev": false,
-  
   "durable_objects": {
     "bindings": [
       {
@@ -22,25 +23,17 @@
       }
     ]
   },
-  
   "migrations": [
     {
-      "tag": "v1",
-      "new_sqlite_classes": ["Sandbox", "SandboxStandard1", "SandboxStandard2", "SandboxStandard3", "ExecResultStore"]
-    },
-    {
-      "tag": "v2",
-      "deleted_classes": ["SandboxStandard1", "SandboxStandard2", "SandboxStandard3"]
+      "tag": "v6"
     }
   ],
-  
   "r2_buckets": [
     {
       "binding": "MOLTBOT_BUCKET",
       "bucket_name": "moltbot-data"
     }
   ],
-  
   "containers": [
     {
       "class_name": "Sandbox",
@@ -49,14 +42,12 @@
       "max_instances": 1
     }
   ],
-  
   "kv_namespaces": [
     {
       "binding": "RELAY",
       "id": "74dfe39996c64c7caad0b655da925cbe"
     }
   ],
-  
   "d1_databases": [
     {
       "binding": "PLATFORM_DB",
@@ -64,6 +55,5 @@
       "database_id": "f3a07958-df87-4465-bab3-3f8e67ea7418"
     }
   ],
-  
   "routes": []
 }

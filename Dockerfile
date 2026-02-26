@@ -21,10 +21,10 @@ RUN ARCH="$(dpkg --print-architecture)" \
 RUN npm install -g pnpm
 
 # Copy pre-built openclaw tarball from local build
-COPY openclaw-2026.2.4.tgz /tmp/
-RUN npm install -g /tmp/openclaw-2026.2.4.tgz \
+COPY openclaw-2026.2.10.tgz /tmp/
+RUN npm install -g /tmp/openclaw-2026.2.10.tgz \
     && openclaw --version \
-    && rm /tmp/openclaw-2026.2.4.tgz
+    && rm /tmp/openclaw-2026.2.10.tgz
 
 # Patch openclaw to fix CaptainApp provider API key resolution
 # Native resolveEnvApiKeyVarName returns var NAME not VALUE — this patch overrides it

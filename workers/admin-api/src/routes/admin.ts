@@ -472,6 +472,59 @@ adminRouter.post('/users/:id/restart-async', async (c) => {
   }
 });
 
+// Hard reset: destroy the sandbox DO/container state entirely, then start gateway.
+// Use this when exec/session layer is wedged ("shell has died") and restart-async is ineffective.
+adminRouter.post('/users/:id/destroy-async', async (c) => {
+  const userId = c.req.param('id');
+
+  try {
+    const sandbox = await getUserSandbox(c.env, userId, true);
+
+    const destroyPromise = (async () => {
+      try {
+        console.log(`[ASYNC-DESTROY] Destroying sandbox for ${userId.slice(0, 8)}...`);
+
+        // Best-effort kill, then destroy.
+        try {
+          await sandbox.killAllProcesses();
+        } catch { /* ignore */ }
+
+        await sandbox.destroy();
+
+        // Give it a moment to fully tear down.
+        await new Promise(r => setTimeout(r, 2000));
+
+        // Re-acquire a fresh sandbox stub after destroy.
+        const fresh = await getUserSandbox(c.env, userId, true);
+        await ensureMoltbotGateway(fresh, c.env, userId);
+
+        const healthy = await checkHealth(fresh);
+        if (!healthy) {
+          throw new Error('Gateway not healthy after destroy');
+        }
+
+        console.log(`[ASYNC-DESTROY] ✅ Gateway healthy for ${userId.slice(0, 8)}`);
+      } catch (err) {
+        console.error(`[ASYNC-DESTROY] Failed for ${userId.slice(0, 8)}:`, err);
+      }
+    })();
+
+    c.executionCtx.waitUntil(destroyPromise);
+
+    return c.json({
+      success: true,
+      userId,
+      message: 'Destroy initiated in background',
+      checkStatusUrl: `/api/super/users/${userId}/state/v2`,
+    });
+  } catch (error) {
+    return c.json({
+      error: error instanceof Error ? error.message : 'Unknown error',
+      userId,
+    }, HTTP_STATUS.INTERNAL_SERVER_ERROR);
+  }
+});
+
 adminRouter.post('/bulk/restart', async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const { userIds: requestedIds, delayMs = 5000 } = body;

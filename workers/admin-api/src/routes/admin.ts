@@ -241,18 +241,17 @@ async function getLiveState(userId: string, env: AdminApiAppEnv['Bindings']) {
 
 async function checkGatewayHealth(sandbox: any): Promise<boolean> {
   const attempt = async (path: string): Promise<boolean> => {
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort('gateway_health_timeout'), 1500);
     try {
-      const response = await sandbox.containerFetch(
-        new Request(`http://localhost:18789${path}`, { signal: ac.signal as any }),
-        18789
+      // Do not attach AbortSignal to Request here: Request is structured-cloned across
+      // the Worker → Sandbox boundary and AbortSignal serialization is disabled.
+      const response = await withTimeout<Response>(
+        sandbox.containerFetch(new Request(`http://localhost:18789${path}`), 18789) as Promise<Response>,
+        1500,
+        `gateway_health${path}`
       );
       return response.status >= 200 && response.status < 600;
     } catch {
       return false;
-    } finally {
-      clearTimeout(timer);
     }
   };
 
@@ -937,12 +936,11 @@ adminRouter.post('/users/:id/message', async (c) => {
         };
 
         const tHook = Date.now();
-        const ac = new AbortController();
-        const timer = setTimeout(() => ac.abort('hook_timeout'), 15000);
         let hookStatus: number | null = null;
         let hookText: string | null = null;
-        try {
-          const res = await sandbox.containerFetch(
+        // Keep Request clone-safe for Worker → Sandbox RPC (no AbortSignal in init).
+        const res = await withTimeout<Response>(
+          sandbox.containerFetch(
             new Request('http://localhost:18789/hooks/agent', {
               method: 'POST',
               headers: {
@@ -950,15 +948,14 @@ adminRouter.post('/users/:id/message', async (c) => {
                 'x-openclaw-token': token,
               },
               body: JSON.stringify(hookPayload),
-              signal: ac.signal as any,
             }),
             18789
-          );
-          hookStatus = res.status;
-          hookText = await res.text().catch(() => null);
-        } finally {
-          clearTimeout(timer);
-        }
+          ) as Promise<Response>,
+          15000,
+          'hook_timeout'
+        );
+        hookStatus = res.status;
+        hookText = await res.text().catch(() => null);
         log({ event: 'hook_done', hookStatus, hookTextPreview: hookText ? hookText.slice(0, 300) : null, ...phase('hook', tHook) });
 
         log({ event: 'complete', totalMs: Date.now() - t0 });

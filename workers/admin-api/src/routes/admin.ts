@@ -260,6 +260,52 @@ async function checkGatewayHealth(sandbox: any): Promise<boolean> {
   return attempt('/');
 }
 
+function toBase64Utf8(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let binary = '';
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary);
+}
+
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+interface MessageFallbackResult {
+  ok: boolean;
+  sessionId: string;
+  exitCode: number | null;
+  stdoutPreview: string | null;
+  stderrPreview: string | null;
+}
+
+async function runAgentCliFallback(sandbox: any, message: string, sessionKey?: string): Promise<MessageFallbackResult> {
+  const sessionId = sessionKey || `admin-${Date.now()}`;
+  const messageB64 = toBase64Utf8(message);
+
+  const script = [
+    `MSG_B64=${shellSingleQuote(messageB64)}`,
+    `SESSION_ID=${shellSingleQuote(sessionId)}`,
+    'MSG="$(printf %s "$MSG_B64" | base64 -d 2>/dev/null || printf %s "$MSG_B64" | base64 --decode 2>/dev/null)"',
+    'openclaw agent --message "$MSG" --session-id "$SESSION_ID" --json --timeout 60',
+  ].join('; ');
+
+  const result = await sandbox.exec(`sh -lc ${shellSingleQuote(script)}`, { timeout: 70000 });
+  const exitCode = typeof result?.exitCode === 'number' ? result.exitCode : null;
+  const stdout = typeof result?.stdout === 'string' ? result.stdout : '';
+  const stderr = typeof result?.stderr === 'string' ? result.stderr : '';
+
+  return {
+    ok: exitCode === 0,
+    sessionId,
+    exitCode,
+    stdoutPreview: stdout ? stdout.slice(0, 300) : null,
+    stderrPreview: stderr ? stderr.slice(0, 300) : null,
+  };
+}
+
 // =============================================================================
 // User Registry Routes
 // =============================================================================
@@ -938,33 +984,77 @@ adminRouter.post('/users/:id/message', async (c) => {
         const tHook = Date.now();
         let hookStatus: number | null = null;
         let hookText: string | null = null;
-        // Keep Request clone-safe for Worker → Sandbox RPC (no AbortSignal in init).
-        const res = await withTimeout<Response>(
-          sandbox.containerFetch(
-            new Request('http://localhost:18789/hooks/agent', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'x-openclaw-token': token,
-              },
-              body: JSON.stringify(hookPayload),
-            }),
-            18789
-          ) as Promise<Response>,
-          15000,
-          'hook_timeout'
-        );
-        hookStatus = res.status;
-        hookText = await res.text().catch(() => null);
-        log({ event: 'hook_done', hookStatus, hookTextPreview: hookText ? hookText.slice(0, 300) : null, ...phase('hook', tHook) });
+        let deliveredVia: 'hook' | 'fallback_cli' = 'hook';
+        let fallbackSessionId: string | undefined;
 
-        log({ event: 'complete', totalMs: Date.now() - t0 });
+        const runFallback = async (reason: 'hook_non_2xx' | 'hook_exception') => {
+          const tFallback = Date.now();
+          log({ event: 'fallback_start', reason, hookStatus });
+          const result = await runAgentCliFallback(sandbox, message, sessionKey);
+          log({
+            event: 'fallback_result',
+            reason,
+            ok: result.ok,
+            exitCode: result.exitCode,
+            sessionId: result.sessionId,
+            stdoutPreview: result.stdoutPreview,
+            stderrPreview: result.stderrPreview,
+            fallbackMs: Date.now() - tFallback,
+          });
+
+          if (!result.ok) {
+            throw new Error(`fallback_failed exitCode=${String(result.exitCode)}`);
+          }
+
+          fallbackSessionId = result.sessionId;
+          deliveredVia = 'fallback_cli';
+        };
+
+        try {
+          // Keep Request clone-safe for Worker → Sandbox RPC (no AbortSignal in init).
+          const res = await withTimeout<Response>(
+            sandbox.containerFetch(
+              new Request('http://localhost:18789/hooks/agent', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'x-openclaw-token': token,
+                },
+                body: JSON.stringify(hookPayload),
+              }),
+              18789
+            ) as Promise<Response>,
+            15000,
+            'hook_timeout'
+          );
+          hookStatus = res.status;
+          hookText = await res.text().catch(() => null);
+          log({ event: 'hook_done', hookStatus, hookTextPreview: hookText ? hookText.slice(0, 300) : null, ...phase('hook', tHook) });
+
+          if (hookStatus < 200 || hookStatus >= 300) {
+            log({ event: 'hook_failed', reason: 'non_2xx', hookStatus, hookTextPreview: hookText ? hookText.slice(0, 300) : null });
+            await runFallback('hook_non_2xx');
+          }
+        } catch (hookError) {
+          const hookErrorMsg = hookError instanceof Error ? hookError.message : String(hookError);
+          log({ event: 'hook_failed', reason: 'exception', hookStatus, hookError: hookErrorMsg, hookMs: Date.now() - tHook });
+          await runFallback('hook_exception');
+        }
+
+        log({ event: 'complete', deliveredVia, hookStatus, totalMs: Date.now() - t0 });
 
         // Cache completion briefly so repeated retries don't spam.
         c.executionCtx.waitUntil(
           caches.default.put(
             dedupeKey,
-            new Response(JSON.stringify({ ...acceptedPayload, status: 'submitted', submittedAt: new Date().toISOString(), hookStatus }), {
+            new Response(JSON.stringify({
+              ...acceptedPayload,
+              status: 'submitted',
+              submittedAt: new Date().toISOString(),
+              deliveredVia,
+              hookStatus,
+              fallbackSessionId,
+            }), {
               status: 200,
               headers: {
                 'Content-Type': 'application/json',
@@ -981,7 +1071,9 @@ adminRouter.post('/users/:id/message', async (c) => {
             ? 'overloaded'
             : /hook_timeout/i.test(msg)
               ? 'hook_timeout'
-              : 'unknown';
+              : /fallback_failed/i.test(msg)
+                ? 'fallback_failed'
+                : 'unknown';
 
         log({ event: 'error', category, error: msg, totalMs: Date.now() - t0 });
 

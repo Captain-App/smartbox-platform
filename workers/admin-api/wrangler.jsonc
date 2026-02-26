@@ -18,7 +18,7 @@
         "name": "EXEC_RESULT_STORE"
       },
       {
-        "class_name": "Sandbox",
+        "class_name": "SandboxV6",
         "name": "Sandbox"
       }
     ]
@@ -36,7 +36,7 @@
   ],
   "containers": [
     {
-      "class_name": "Sandbox",
+      "class_name": "SandboxV6",
       "image": "../../Dockerfile",
       "instance_type": "standard-1",
       "max_instances": 1

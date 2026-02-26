@@ -45,7 +45,7 @@ app.onError((err, c) => {
     error: 'Internal server error',
     message: err.message,
     timestamp: new Date().toISOString(),
-  }, 500);
+  }, { status: 500 });
 });
 
 // =============================================================================
@@ -69,7 +69,7 @@ app.notFound((c) => {
   return c.json({
     error: 'Not found',
     path: c.req.path,
-  }, 404);
+  }, { status: 404 });
 });
 
 // =============================================================================
@@ -77,6 +77,8 @@ app.notFound((c) => {
 // =============================================================================
 
 // Re-export Sandbox from the SDK — container bindings need the real class
+// NOTE: existing production deployments depend on the class name `SandboxV6`.
+export { Sandbox as SandboxV6 } from '@cloudflare/sandbox';
 export { Sandbox } from '@cloudflare/sandbox';
 
 // =============================================================================

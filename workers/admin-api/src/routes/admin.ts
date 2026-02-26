@@ -289,10 +289,11 @@ async function runAgentCliFallback(sandbox: any, message: string, sessionKey?: s
     `MSG_B64=${shellSingleQuote(messageB64)}`,
     `SESSION_ID=${shellSingleQuote(sessionId)}`,
     'MSG="$(printf %s "$MSG_B64" | base64 -d 2>/dev/null || printf %s "$MSG_B64" | base64 --decode 2>/dev/null)"',
-    'openclaw agent --message "$MSG" --session-id "$SESSION_ID" --json --timeout 60',
+    // Keep fallback bounded so Worker waitUntil is less likely to be cancelled.
+    'openclaw agent --message "$MSG" --session-id "$SESSION_ID" --json --timeout 20',
   ].join('; ');
 
-  const result = await sandbox.exec(`sh -lc ${shellSingleQuote(script)}`, { timeout: 70000 });
+  const result = await sandbox.exec(`sh -lc ${shellSingleQuote(script)}`, { timeout: 30000 });
   const exitCode = typeof result?.exitCode === 'number' ? result.exitCode : null;
   const stdout = typeof result?.stdout === 'string' ? result.stdout : '';
   const stderr = typeof result?.stderr === 'string' ? result.stderr : '';
@@ -986,8 +987,10 @@ adminRouter.post('/users/:id/message', async (c) => {
         let hookText: string | null = null;
         let deliveredVia: 'hook' | 'fallback_cli' = 'hook';
         let fallbackSessionId: string | undefined;
+        let fallbackAttempted = false;
 
         const runFallback = async (reason: 'hook_non_2xx' | 'hook_exception') => {
+          fallbackAttempted = true;
           const tFallback = Date.now();
           log({ event: 'fallback_start', reason, hookStatus });
           const result = await runAgentCliFallback(sandbox, message, sessionKey);
@@ -1011,25 +1014,47 @@ adminRouter.post('/users/:id/message', async (c) => {
         };
 
         try {
-          // Keep Request clone-safe for Worker → Sandbox RPC (no AbortSignal in init).
-          const res = await withTimeout<Response>(
-            sandbox.containerFetch(
-              new Request('http://localhost:18789/hooks/agent', {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'x-openclaw-token': token,
-                },
-                body: JSON.stringify(hookPayload),
-              }),
-              18789
-            ) as Promise<Response>,
-            15000,
+          // containerFetch(Request) has intermittently degraded to GET across Worker -> Sandbox
+          // boundaries in production. Use an in-container curl probe for deterministic POST semantics.
+          const hookPayloadB64 = toBase64Utf8(JSON.stringify(hookPayload));
+          const hookScript = [
+            `PAYLOAD_B64=${shellSingleQuote(hookPayloadB64)}`,
+            `HOOK_TOKEN=${shellSingleQuote(token)}`,
+            'PAYLOAD="$(printf %s "$PAYLOAD_B64" | base64 -d 2>/dev/null || printf %s "$PAYLOAD_B64" | base64 --decode 2>/dev/null)"',
+            'CODE="$(curl --connect-timeout 2 --max-time 8 -sS -o /tmp/admin-hook.out -w "%{http_code}" -X POST http://127.0.0.1:18789/hooks/agent -H "x-openclaw-token: $HOOK_TOKEN" -H "Content-Type: application/json" --data "$PAYLOAD")"',
+            'printf "%s\\n" "$CODE"',
+            'head -c 400 /tmp/admin-hook.out || true',
+          ].join('; ');
+
+          const hookExec = await withTimeout<any>(
+            sandbox.exec(`sh -lc ${shellSingleQuote(hookScript)}`, { timeout: 10000 }) as Promise<any>,
+            11000,
             'hook_timeout'
           );
-          hookStatus = res.status;
-          hookText = await res.text().catch(() => null);
-          log({ event: 'hook_done', hookStatus, hookTextPreview: hookText ? hookText.slice(0, 300) : null, ...phase('hook', tHook) });
+
+          const hookExitCode = typeof hookExec?.exitCode === 'number' ? hookExec.exitCode : null;
+          const hookStdout = typeof hookExec?.stdout === 'string' ? hookExec.stdout : '';
+          const hookStderr = typeof hookExec?.stderr === 'string' ? hookExec.stderr : '';
+          if (hookExitCode !== 0) {
+            throw new Error(`hook_exec_failed exitCode=${String(hookExitCode)} stderr=${hookStderr.slice(0, 200)}`);
+          }
+
+          const [statusLineRaw, ...bodyLines] = hookStdout.split(/\r?\n/);
+          const parsedStatus = Number.parseInt((statusLineRaw ?? '').trim(), 10);
+          hookStatus = Number.isFinite(parsedStatus) ? parsedStatus : null;
+          hookText = bodyLines.join('\n').trim() || null;
+
+          log({
+            event: 'hook_done',
+            hookStatus,
+            hookTextPreview: hookText ? hookText.slice(0, 300) : null,
+            hookStderrPreview: hookStderr ? hookStderr.slice(0, 200) : null,
+            ...phase('hook', tHook),
+          });
+
+          if (hookStatus === null) {
+            throw new Error(`hook_status_parse_failed stdout=${hookStdout.slice(0, 200)}`);
+          }
 
           if (hookStatus < 200 || hookStatus >= 300) {
             log({ event: 'hook_failed', reason: 'non_2xx', hookStatus, hookTextPreview: hookText ? hookText.slice(0, 300) : null });
@@ -1038,6 +1063,9 @@ adminRouter.post('/users/:id/message', async (c) => {
         } catch (hookError) {
           const hookErrorMsg = hookError instanceof Error ? hookError.message : String(hookError);
           log({ event: 'hook_failed', reason: 'exception', hookStatus, hookError: hookErrorMsg, hookMs: Date.now() - tHook });
+          if (fallbackAttempted) {
+            throw hookError;
+          }
           await runFallback('hook_exception');
         }
 

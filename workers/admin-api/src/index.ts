@@ -80,6 +80,11 @@ app.notFound((c) => {
 // NOTE: existing production deployments depend on the class name `SandboxV6`.
 export { Sandbox as SandboxV6 } from '@cloudflare/sandbox';
 // Legacy class names still referenced by existing Durable Objects in production.
+export { Sandbox as SandboxV1 } from '@cloudflare/sandbox';
+export { Sandbox as SandboxV2 } from '@cloudflare/sandbox';
+export { Sandbox as SandboxV3 } from '@cloudflare/sandbox';
+export { Sandbox as SandboxV4 } from '@cloudflare/sandbox';
+export { Sandbox as SandboxV5 } from '@cloudflare/sandbox';
 export { Sandbox as SandboxStandard1 } from '@cloudflare/sandbox';
 export { Sandbox as SandboxStandard2 } from '@cloudflare/sandbox';
 export { Sandbox as SandboxStandard3 } from '@cloudflare/sandbox';

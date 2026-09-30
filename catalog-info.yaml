@@ -1,0 +1,16 @@
+# Backstage catalog entry — discovered by https://backstage.captainapp.co.uk
+# (captain-k3s GitHub App). Edit freely: type, lifecycle, system, owner, links.
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: smartbox-platform
+  description: "Run OpenClaw, (formerly Moltbot, formerly Clawdbot) on Cloudflare Workers"
+  annotations:
+    github.com/project-slug: Captain-App/smartbox-platform
+  tags:
+    - fork
+    - typescript
+spec:
+  type: service
+  lifecycle: production
+  owner: group:default/captain-app
